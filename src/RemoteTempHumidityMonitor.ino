@@ -31,13 +31,17 @@ bool firstRun = true;
 // Cloud variables (read-only from cloud)
 String lastReading = "{}";
 int currentInterval = 10; // In seconds for easier cloud reading
+bool shortMsgEnabled = true; // Short message enabled status
+unsigned long shortMsgStartTime = 0; // Track when short messages started (0 = not started)
 
 // Function prototypes
 void takeMeasurement();
 void publishReading(float temperature, float humidity);
 String createJsonPayload(float temperature, float humidity);
+String createShortPayload(float temperature, float humidity);
 int setInterval(String command);
 int forceReading(String command);
+int enableShortMsg(String command);
 
 void setup() {
     // Start serial for debugging
@@ -46,10 +50,12 @@ void setup() {
     // Register cloud functions (must be done in setup before cloud connects)
     Particle.function("setInterval", setInterval);
     Particle.function("forceReading", forceReading);
+    Particle.function("enableShort", enableShortMsg);
 
     // Register cloud variables
     Particle.variable("lastReading", lastReading);
     Particle.variable("intervalSec", currentInterval);
+    Particle.variable("shortMsg", shortMsgEnabled);
 
     // Initialize DHT sensor
     dht.begin();
@@ -61,6 +67,9 @@ void setup() {
     Serial.printlnf("Measurement interval: %d seconds", currentInterval);
     Serial.println("Using custom interrupt-based DHT22 library");
     Serial.println("DHT22 on D3 - External 10k pullup REQUIRED (internal disabled)");
+
+    // Initialize short message timer
+    shortMsgStartTime = Time.now();
 
     // Wait for cloud connection before first reading
     waitFor(Particle.connected, 60000);
@@ -122,14 +131,27 @@ void takeMeasurement() {
     lastTemperature = temperature;
     lastHumidity = humidity;
 
-    // Create and store JSON reading
+    // Always create and store JSON format
     lastReading = createJsonPayload(temperature, humidity);
+
+    // Check if short message should be disabled (after 1 hour)
+    if (shortMsgEnabled && shortMsgStartTime > 0) {
+        unsigned long elapsed = Time.now() - shortMsgStartTime;
+        if (elapsed >= 3600) {  // 3600 seconds = 1 hour
+            shortMsgEnabled = false;
+            Serial.println("INFO: Short message disabled after 1 hour");
+            if (Particle.connected()) {
+                Particle.publish("sensor/info", "Short messages disabled", PRIVATE);
+            }
+        }
+    }
 
     // Print to serial
     Serial.println("✓ Reading successful!");
     Serial.printlnf("  Temperature: %.2f°C (%.2f°F)", temperature, temperature * 9.0 / 5.0 + 32.0);
     Serial.printlnf("  Humidity: %.2f%%", humidity);
     Serial.printlnf("  Dew Point: %.2f°C", temperature - ((100 - humidity) / 5.0));
+    Serial.printlnf("  Short message: %s", shortMsgEnabled ? "enabled" : "disabled");
     Serial.println("JSON: " + lastReading);
 
     // Publish to cloud
@@ -143,15 +165,26 @@ void publishReading(float temperature, float humidity) {
         return;
     }
 
+    // Always publish JSON format for InfluxDB/Grafana
     String jsonData = createJsonPayload(temperature, humidity);
+    bool jsonSuccess = Particle.publish("sensor/reading", jsonData, PRIVATE);
 
-    // Publish as event
-    bool success = Particle.publish("sensor/reading", jsonData, PRIVATE);
-
-    if (success) {
-        Serial.println("Reading published successfully");
+    if (jsonSuccess) {
+        Serial.println("JSON reading published successfully");
     } else {
-        Serial.println("ERROR: Failed to publish reading");
+        Serial.println("ERROR: Failed to publish JSON reading");
+    }
+
+    // Additionally publish short message if enabled (within 1 hour)
+    if (shortMsgEnabled) {
+        String shortData = createShortPayload(temperature, humidity);
+        bool shortSuccess = Particle.publish("sensor/short", shortData, PRIVATE);
+
+        if (shortSuccess) {
+            Serial.printlnf("Short message published: %s", shortData.c_str());
+        } else {
+            Serial.println("ERROR: Failed to publish short message");
+        }
     }
 }
 
@@ -181,6 +214,14 @@ String createJsonPayload(float temperature, float humidity) {
     return String(writer.buffer());
 }
 
+String createShortPayload(float temperature, float humidity) {
+    // Create short human-readable format (20 characters or less)
+    // Format: "23.5C 45.6%" (max 13 chars for this format)
+    char shortBuffer[21];  // 20 chars + null terminator
+    snprintf(shortBuffer, sizeof(shortBuffer), "%.1fC %.1f%%", temperature, humidity);
+    return String(shortBuffer);
+}
+
 // Cloud function to set measurement interval (in seconds)
 int setInterval(String command) {
     int newInterval = command.toInt();
@@ -205,4 +246,30 @@ int forceReading(String command) {
     Serial.println("Force reading requested from cloud");
     takeMeasurement();
     return 1;
+}
+
+// Cloud function to enable/disable short messages
+int enableShortMsg(String command) {
+    // Parse command: empty, "1", or no input = enable, "0" = disable
+    bool shouldEnable = true;
+
+    if (command.length() > 0) {
+        int value = command.toInt();
+        shouldEnable = (value != 0);
+    }
+
+    if (shouldEnable) {
+        // Enable short messages and reset timer
+        shortMsgEnabled = true;
+        shortMsgStartTime = Time.now();
+        Serial.println("Short messages enabled");
+        Particle.publish("config/shortmsg", "enabled", PRIVATE);
+        return 1;
+    } else {
+        // Disable short messages
+        shortMsgEnabled = false;
+        Serial.println("Short messages disabled");
+        Particle.publish("config/shortmsg", "disabled", PRIVATE);
+        return 0;
+    }
 }

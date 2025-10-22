@@ -1,0 +1,24 @@
+# Particle Build Files
+*.bin
+target/
+.vscode/
+.settings/
+
+# Compiled Object files
+*.o
+*.obj
+
+# Dependency files
+*.d
+
+# Build directories
+build/
+
+# IDE files
+.DS_Store
+Thumbs.db
+
+# Particle Cloud compiled binaries
+boron_firmware_*.bin
+argon_firmware_*.bin
+photon_firmware_*.bin

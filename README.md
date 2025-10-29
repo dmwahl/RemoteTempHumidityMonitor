@@ -343,7 +343,166 @@ docker run -d --restart=unless-stopped \
   particle-influx-bridge
 ```
 
-### Method 3: Direct Particle API Polling (No Bridge)
+### Method 3: Telegraf with HTTP Listener + Particle Webhook
+
+**Best for:** Existing Telegraf deployments with InfluxDB integration, especially on Synology NAS or appliances where custom scripts may be lost during updates.
+
+This method uses Particle Webhooks to push data to Telegraf's HTTP listener - no custom scripts or cron jobs required.
+
+#### Step 1: Configure Telegraf HTTP Listener
+
+Add to your Telegraf configuration file (usually `/etc/telegraf/telegraf.conf` or on Synology: Portainer container config):
+
+```toml
+# Receive Particle webhook data
+[[inputs.http_listener_v2]]
+  ## Address and port to listen on
+  ## On Synology: ensure this port is not blocked by firewall
+  service_address = ":8086"
+
+  ## Path to listen on
+  path = "/particle"
+
+  ## Data format
+  data_format = "json_v2"
+
+  [[inputs.http_listener_v2.json_v2]]
+    ## Measurement name (from JSON field)
+    measurement_name_path = "measurement"
+
+    ## Timestamp field (Unix timestamp in seconds)
+    timestamp_path = "timestamp"
+    timestamp_format = "unix"
+
+    ## Tags (device identifiers)
+    [[inputs.http_listener_v2.json_v2.tag]]
+      path = "tags.location"
+      rename = "location"
+
+    [[inputs.http_listener_v2.json_v2.tag]]
+      path = "tags.device"
+      rename = "device"
+
+    ## Fields (sensor readings)
+    [[inputs.http_listener_v2.json_v2.field]]
+      path = "fields.temperature"
+      rename = "temperature"
+      type = "float"
+
+    [[inputs.http_listener_v2.json_v2.field]]
+      path = "fields.humidity"
+      rename = "humidity"
+      type = "float"
+
+# Output to InfluxDB
+[[outputs.influxdb_v2]]
+  ## InfluxDB URL (adjust for your setup)
+  ## On Synology: use container network address or localhost
+  urls = ["http://localhost:8086"]
+
+  ## Authentication
+  token = "your-influxdb-token"
+  organization = "your-org"
+  bucket = "your-bucket"
+
+  ## Optional: Add timeout for writes
+  timeout = "5s"
+```
+
+**Synology-specific notes:**
+- If running Telegraf in Docker/Portainer, use bridge networking or host mode
+- Map port 8086 (or your chosen port) in container settings
+- Ensure Synology firewall allows incoming connections on this port
+
+#### Step 2: Restart Telegraf
+
+**Linux/Standard:**
+```bash
+sudo systemctl restart telegraf
+sudo systemctl status telegraf
+```
+
+**Synology/Docker:**
+- Restart the Telegraf container in Portainer or Docker UI
+- Check logs to verify HTTP listener started
+
+#### Step 3: Configure Particle Webhook
+
+1. Go to [Particle Console](https://console.particle.io) → Integrations → New Integration → Webhook
+
+2. **Configure the webhook:**
+   - **Event Name:** `sensor/reading`
+   - **URL:** `http://YOUR_SYNOLOGY_IP:8086/particle`
+     - Replace `YOUR_SYNOLOGY_IP` with your Synology's local IP address
+     - If Telegraf is on different port, adjust accordingly
+   - **Request Type:** `POST`
+   - **Request Format:** `JSON`
+   - **Device:** Select your Particle device (or leave as "Any")
+   - **JSON Data:** Leave default - will send `{{PARTICLE_EVENT_VALUE}}`
+
+3. **Advanced Settings (optional):**
+   - **Enforce SSL:** No (since it's local network)
+   - **HTTP Basic Auth:** Not needed for local setup
+
+4. **Save** the webhook
+
+#### Step 4: Test the Integration
+
+**Trigger a test reading:**
+```bash
+particle call <device-name> forceReading
+```
+
+**Check Telegraf is receiving data:**
+
+Linux:
+```bash
+sudo journalctl -u telegraf -f
+```
+
+Synology/Docker:
+```bash
+docker logs -f telegraf-container-name
+```
+
+You should see logs like:
+```
+2025-01-18T10:30:00Z I! [inputs.http_listener_v2] Received POST request on /particle
+```
+
+**Verify data in InfluxDB:**
+```bash
+influx query 'from(bucket:"your-bucket")
+  |> range(start:-1h)
+  |> filter(fn:(r) => r._measurement == "environment")'
+```
+
+#### Step 5: Monitor Webhook Status
+
+In Particle Console → Integrations → Your Webhook:
+- View **Logs** tab to see webhook execution history
+- Check for HTTP response codes (200 = success)
+- Look for any error messages
+
+#### Troubleshooting
+
+**Webhook fails (no response):**
+- Verify Telegraf container is running
+- Check Synology firewall allows port 8086
+- Ensure URL uses local IP, not localhost (Particle Cloud can't reach localhost)
+- Test manually: `curl -X POST http://YOUR_IP:8086/particle -d '{"test":"data"}'`
+
+**Data not appearing in InfluxDB:**
+- Check Telegraf logs for parsing errors
+- Verify InfluxDB token has write permissions
+- Confirm bucket name is correct
+- Test InfluxDB connection: `influx ping`
+
+**Port conflicts:**
+- If port 8086 is used by InfluxDB, choose different port for Telegraf (e.g., 8087)
+- Update both Telegraf config and Particle webhook URL
+
+### Method 4: Direct Particle API Polling (No Bridge)
 
 Poll the Particle Cloud API periodically from your local network:
 

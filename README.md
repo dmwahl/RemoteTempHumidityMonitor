@@ -169,9 +169,24 @@ Published when sensor reading fails after retry.
 
 ## Integration with InfluxDB & Grafana
 
+### Network Architecture Overview
+
+Choose the integration method based on your network setup:
+
+| Method | Inbound Access Needed | Outbound Access Needed | Best For |
+|--------|----------------------|------------------------|----------|
+| Method 1: Webhooks | ✅ InfluxDB must be publicly accessible | ❌ Not required | Cloud-hosted InfluxDB |
+| Method 2: Bridge Service | ❌ No inbound required | ✅ Bridge needs outbound to Particle & InfluxDB | **Firewalled networks (most home/office setups)** |
+| Method 3: Telegraf + Webhook | ✅ Telegraf must accept external connections | ❌ Not required | Networks with port forwarding enabled |
+| Method 4: API Polling | ❌ No inbound required | ✅ Needs outbound to Particle API | Simple setups, manual polling |
+
+**⚠️ Important:** If your network blocks all incoming connections from the internet (most residential/corporate networks), use **Method 2 (Bridge Service)**.
+
 ### Method 1: Particle Webhooks (External InfluxDB)
 
 **Best for:** InfluxDB servers with public internet access
+
+**Network Requirements:** InfluxDB must be accessible from the internet (Particle Cloud → InfluxDB)
 
 1. **Create Webhook** in [Particle Console](https://console.particle.io) → Integrations
 2. **Configure:**
@@ -188,13 +203,25 @@ Published when sensor reading fails after retry.
      {{{PARTICLE_EVENT_VALUE}}}
      ```
 
-### Method 2: Custom Bridge (Firewalled InfluxDB)
+### Method 2: Custom Bridge (Firewalled InfluxDB) ⭐ RECOMMENDED
 
-**Best for:** InfluxDB servers behind firewall with no external access
+**Best for:** InfluxDB servers behind firewall with no external/inbound access allowed
 
-Since the Particle device publishes events to Particle Cloud, but your InfluxDB is not accessible from the internet, you need a bridge service running on your local network that can:
-1. Subscribe to Particle Cloud events (outbound connection)
-2. Write to local InfluxDB (internal connection)
+**Network Requirements:**
+- ❌ No inbound connections required
+- ✅ Bridge makes outbound connections to Particle Cloud (subscribes to events)
+- ✅ Bridge writes to InfluxDB on local network
+
+**Perfect for:**
+- Home networks without port forwarding
+- Corporate networks with strict firewall policies
+- Synology NAS with no external access
+- Dynamic IP addresses
+- Networks where exposing services is not allowed
+
+Since the Particle device publishes events to Particle Cloud, but your InfluxDB is not accessible from the internet, you need a bridge service running on your local network that:
+1. Makes **outbound** connection to Particle Cloud (subscribes to event stream)
+2. Writes to local InfluxDB (internal connection)
 
 #### Option A: Node.js Bridge Service
 
@@ -345,9 +372,23 @@ docker run -d --restart=unless-stopped \
 
 ### Method 3: Telegraf with HTTP Listener + Particle Webhook
 
-**Best for:** Existing Telegraf deployments with InfluxDB integration, especially on Synology NAS or appliances where custom scripts may be lost during updates.
+**Best for:** Networks with port forwarding enabled and existing Telegraf deployments
 
-This method uses Particle Webhooks to push data to Telegraf's HTTP listener - no custom scripts or cron jobs required.
+**Network Requirements:**
+- ✅ Telegraf must accept **inbound** connections from Particle Cloud
+- ✅ Port forwarding required (Router → Telegraf)
+- ✅ Static IP or Dynamic DNS recommended
+- ❌ InfluxDB only needs **internal** network access
+
+**⚠️ WARNING:** This method requires exposing Telegraf to the internet. If your network:
+- Blocks all incoming connections
+- Has dynamic IP without DDNS
+- Is behind strict corporate firewall
+- Cannot configure port forwarding
+
+**→ Use Method 2 (Bridge Service) instead**
+
+This method uses Particle Webhooks to push data to Telegraf's HTTP listener.
 
 #### Step 1: Configure Telegraf HTTP Listener
 
@@ -414,6 +455,12 @@ Add to your Telegraf configuration file (usually `/etc/telegraf/telegraf.conf` o
 - Map port 8086 (or your chosen port) in container settings
 - Ensure Synology firewall allows incoming connections on this port
 
+**Port Forwarding Requirements:**
+- Configure your router to forward external port (e.g., 8086) to Synology IP:8086
+- In Particle webhook, use your **public IP or domain**: `http://YOUR_PUBLIC_IP:8086/particle`
+- Security: Consider using non-standard port (e.g., 18086) and implement rate limiting
+- Alternative: Use dynamic DNS service if your ISP changes your IP frequently
+
 #### Step 2: Restart Telegraf
 
 **Linux/Standard:**
@@ -432,17 +479,18 @@ sudo systemctl status telegraf
 
 2. **Configure the webhook:**
    - **Event Name:** `sensor/reading`
-   - **URL:** `http://YOUR_SYNOLOGY_IP:8086/particle`
-     - Replace `YOUR_SYNOLOGY_IP` with your Synology's local IP address
-     - If Telegraf is on different port, adjust accordingly
+   - **URL:** `http://YOUR_PUBLIC_IP:8086/particle`
+     - Use your **public IP address** or domain name (NOT local IP)
+     - If using port forwarding, use the external port number
+     - Example: `http://203.0.113.45:8086/particle` or `http://mynas.ddns.net:8086/particle`
    - **Request Type:** `POST`
    - **Request Format:** `JSON`
    - **Device:** Select your Particle device (or leave as "Any")
    - **JSON Data:** Leave default - will send `{{PARTICLE_EVENT_VALUE}}`
 
-3. **Advanced Settings (optional):**
-   - **Enforce SSL:** No (since it's local network)
-   - **HTTP Basic Auth:** Not needed for local setup
+3. **Advanced Settings:**
+   - **Enforce SSL:** No (HTTP only, unless you setup HTTPS with reverse proxy)
+   - **HTTP Basic Auth:** Not needed (optional for added security)
 
 4. **Save** the webhook
 
@@ -489,8 +537,10 @@ In Particle Console → Integrations → Your Webhook:
 **Webhook fails (no response):**
 - Verify Telegraf container is running
 - Check Synology firewall allows port 8086
-- Ensure URL uses local IP, not localhost (Particle Cloud can't reach localhost)
-- Test manually: `curl -X POST http://YOUR_IP:8086/particle -d '{"test":"data"}'`
+- **Verify port forwarding** is configured on your router (external → Synology)
+- Ensure webhook URL uses **public IP**, not local/private IP (192.168.x.x won't work)
+- Test externally: Use online webhook tester or mobile network to POST to your public URL
+- Test internally: `curl -X POST http://localhost:8086/particle -d '{"measurement":"test"}'`
 
 **Data not appearing in InfluxDB:**
 - Check Telegraf logs for parsing errors

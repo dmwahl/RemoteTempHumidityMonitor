@@ -169,7 +169,9 @@ Published when sensor reading fails after retry.
 
 ## Integration with InfluxDB & Grafana
 
-### Method 1: Particle Webhooks
+### Method 1: Particle Webhooks (External InfluxDB)
+
+**Best for:** InfluxDB servers with public internet access
 
 1. **Create Webhook** in [Particle Console](https://console.particle.io) → Integrations
 2. **Configure:**
@@ -186,24 +188,170 @@ Published when sensor reading fails after retry.
      {{{PARTICLE_EVENT_VALUE}}}
      ```
 
-### Method 2: Custom Integration
+### Method 2: Custom Bridge (Firewalled InfluxDB)
 
-Use the Particle API to subscribe to events and forward to InfluxDB:
+**Best for:** InfluxDB servers behind firewall with no external access
+
+Since the Particle device publishes events to Particle Cloud, but your InfluxDB is not accessible from the internet, you need a bridge service running on your local network that can:
+1. Subscribe to Particle Cloud events (outbound connection)
+2. Write to local InfluxDB (internal connection)
+
+#### Option A: Node.js Bridge Service
+
+Create a bridge service that runs on your local network:
 
 ```javascript
-const particle = new Particle();
+const Particle = require('particle-api-js');
+const { InfluxDB, Point } = require('@influxdata/influxdb-client');
 
+// Particle configuration
+const particle = new Particle();
+const PARTICLE_TOKEN = 'your-particle-token';
+const DEVICE_ID = 'your-device-id';
+
+// InfluxDB configuration (local network)
+const influxDB = new InfluxDB({
+  url: 'http://localhost:8086',  // or your local InfluxDB IP
+  token: 'your-local-influxdb-token'
+});
+const writeApi = influxDB.getWriteApi('your-org', 'your-bucket');
+
+// Subscribe to Particle events
 particle.getEventStream({
-  deviceId: 'your-device-id',
+  deviceId: DEVICE_ID,
   name: 'sensor/reading',
-  auth: token
+  auth: PARTICLE_TOKEN
 }).then(stream => {
+  console.log('Connected to Particle event stream');
+
   stream.on('event', data => {
-    const payload = JSON.parse(data.data);
-    // Forward to InfluxDB
-    writeToInfluxDB(payload);
+    try {
+      const payload = JSON.parse(data.data);
+
+      // Write to InfluxDB
+      const point = new Point(payload.measurement)
+        .tag('location', payload.tags.location)
+        .tag('device', payload.tags.device)
+        .floatField('temperature', payload.fields.temperature)
+        .floatField('humidity', payload.fields.humidity)
+        .timestamp(new Date(payload.timestamp * 1000));
+
+      writeApi.writePoint(point);
+      writeApi.flush();
+
+      console.log(`Written: ${payload.fields.temperature}°C, ${payload.fields.humidity}%`);
+    } catch (error) {
+      console.error('Error processing event:', error);
+    }
+  });
+
+  stream.on('error', error => {
+    console.error('Stream error:', error);
   });
 });
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  writeApi.close().then(() => process.exit(0));
+});
+```
+
+**Installation:**
+```bash
+npm install particle-api-js @influxdata/influxdb-client
+node bridge.js
+```
+
+#### Option B: Python Bridge Service
+
+```python
+from particle import ParticleCloud
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
+import json
+
+# Particle configuration
+PARTICLE_TOKEN = 'your-particle-token'
+DEVICE_ID = 'your-device-id'
+
+# InfluxDB configuration (local network)
+influx_client = InfluxDBClient(
+    url='http://localhost:8086',  # or your local InfluxDB IP
+    token='your-local-influxdb-token',
+    org='your-org'
+)
+write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+
+# Connect to Particle Cloud
+cloud = ParticleCloud(PARTICLE_TOKEN)
+
+def event_handler(event):
+    try:
+        data = json.loads(event.data)
+
+        # Create InfluxDB point
+        point = Point(data['measurement']) \
+            .tag('location', data['tags']['location']) \
+            .tag('device', data['tags']['device']) \
+            .field('temperature', float(data['fields']['temperature'])) \
+            .field('humidity', float(data['fields']['humidity'])) \
+            .time(data['timestamp'])
+
+        # Write to InfluxDB
+        write_api.write(bucket='your-bucket', record=point)
+        print(f"Written: {data['fields']['temperature']}°C, {data['fields']['humidity']}%")
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+# Subscribe to events
+device = cloud.devices.get(DEVICE_ID)
+stream = cloud.subscribe('sensor/reading', event_handler)
+
+print('Listening for events...')
+stream.start()
+```
+
+**Installation:**
+```bash
+pip install particle-cloud influxdb-client
+python bridge.py
+```
+
+#### Option C: Docker Container
+
+Run the bridge as a Docker container on your local network:
+
+```dockerfile
+# Dockerfile
+FROM node:18-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY bridge.js .
+CMD ["node", "bridge.js"]
+```
+
+```bash
+docker build -t particle-influx-bridge .
+docker run -d --restart=unless-stopped \
+  -e PARTICLE_TOKEN=your-token \
+  -e DEVICE_ID=your-device-id \
+  -e INFLUX_URL=http://your-influxdb:8086 \
+  -e INFLUX_TOKEN=your-token \
+  --name particle-bridge \
+  particle-influx-bridge
+```
+
+### Method 3: Direct Particle API Polling (No Bridge)
+
+Poll the Particle Cloud API periodically from your local network:
+
+```bash
+# Cron job to fetch data every minute
+* * * * * curl -s "https://api.particle.io/v1/devices/DEVICE_ID/lastReading?access_token=TOKEN" | \
+  jq -r '.result' | \
+  influx write -b your-bucket -o your-org -
 ```
 
 ### Grafana Dashboard

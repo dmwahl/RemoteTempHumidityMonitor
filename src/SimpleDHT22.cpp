@@ -10,7 +10,7 @@ SimpleDHT22::SimpleDHT22(pin_t pin) : _pin(pin), _lastTemperature(0), _lastHumid
 
 void SimpleDHT22::begin() {
     pinMode(_pin, INPUT);  // No internal pull-up, use external resistor only
-    Serial.printlnf("DHT22 Init: Using hardware timer + Particle GPIO on pin %d", _pin);
+    Log.info("DHT22 Init: Using hardware timer + Particle GPIO on pin %d", _pin);
     delay(1000);    // DHT22 requires 1 second to stabilize after power-on
 }
 
@@ -59,7 +59,7 @@ bool SimpleDHT22::read(float &temperature, float &humidity) {
         // Read raw data from sensor
         if (!readRawData(data)) {
             if (attempts < maxAttempts) {
-                Serial.printlnf("DHT22 read attempt %d failed, retrying...", attempts);
+                Log.warn("DHT22 read attempt %d failed, retrying...", attempts);
                 delay(100);  // Short delay before retry
                 continue;
             }
@@ -71,7 +71,7 @@ bool SimpleDHT22::read(float &temperature, float &humidity) {
         uint8_t checksum = data[0] + data[1] + data[2] + data[3];
         if (checksum != data[4]) {
             if (attempts < maxAttempts) {
-                Serial.printlnf("DHT22 checksum failed (attempt %d), retrying...", attempts);
+                Log.warn("DHT22 checksum failed (attempt %d), retrying...", attempts);
                 delay(100);  // Short delay before retry
                 continue;
             }
@@ -95,7 +95,7 @@ bool SimpleDHT22::read(float &temperature, float &humidity) {
         // Validate ranges
         if (humidity < 0 || humidity > 100 || temperature < -40 || temperature > 80) {
             if (attempts < maxAttempts) {
-                Serial.printlnf("DHT22 values out of range (attempt %d), retrying...", attempts);
+                Log.warn("DHT22 values out of range (attempt %d), retrying...", attempts);
                 delay(100);  // Short delay before retry
                 continue;
             }
@@ -108,7 +108,7 @@ bool SimpleDHT22::read(float &temperature, float &humidity) {
     }
 
     if (success && attempts > 1) {
-        Serial.printlnf("DHT22 read succeeded on attempt %d", attempts);
+        Log.info("DHT22 read succeeded on attempt %d", attempts);
     }
 
     // Store successful reading

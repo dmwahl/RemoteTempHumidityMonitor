@@ -15,6 +15,11 @@
 // DHT22 Configuration
 #define DHTPIN D3
 
+// EEPROM Configuration
+#define EEPROM_INTERVAL_ADDR 0  // Address to store measurement interval
+#define EEPROM_MAGIC_ADDR 4     // Address to store magic number (validation)
+#define EEPROM_MAGIC 0xA5B4C3D2 // Magic number to validate EEPROM data
+
 // System mode - Use AUTOMATIC for reliable cloud connection
 SYSTEM_MODE(AUTOMATIC);
 
@@ -24,6 +29,7 @@ SimpleDHT22 dht(DHTPIN);
 // Global variables
 unsigned long measurementInterval = 10000; // Default 10 seconds in milliseconds
 unsigned long lastMeasurement = 0;
+unsigned long lastSuccessfulReading = 0; // Timestamp of last successful reading
 float lastTemperature = 0.0;
 float lastHumidity = 0.0;
 bool firstRun = true;
@@ -33,19 +39,24 @@ String lastReading = "{}";
 int currentInterval = 10; // In seconds for easier cloud reading
 bool shortMsgEnabled = true; // Short message enabled status
 unsigned long shortMsgStartTime = 0; // Track when short messages started (0 = not started)
+double cloudTemperature = 0.0; // Cloud-accessible temperature value
+double cloudHumidity = 0.0; // Cloud-accessible humidity value
+int readingAge = 0; // Age of last reading in seconds
 
 // Function prototypes
 void takeMeasurement();
 void publishReading(float temperature, float humidity);
 String createJsonPayload(float temperature, float humidity);
 String createShortPayload(float temperature, float humidity);
+void loadIntervalFromEEPROM();
+void saveIntervalToEEPROM(int intervalSeconds);
 int setInterval(String command);
 int forceReading(String command);
 int enableShortMsg(String command);
 
 void setup() {
-    // Start serial for debugging
-    Serial.begin(9600);
+    // Load saved measurement interval from EEPROM
+    loadIntervalFromEEPROM();
 
     // Register cloud functions (must be done in setup before cloud connects)
     Particle.function("setInterval", setInterval);
@@ -56,6 +67,9 @@ void setup() {
     Particle.variable("lastReading", lastReading);
     Particle.variable("intervalSec", currentInterval);
     Particle.variable("shortMsg", shortMsgEnabled);
+    Particle.variable("temperature", cloudTemperature);
+    Particle.variable("humidity", cloudHumidity);
+    Particle.variable("readingAge", readingAge);
 
     // Initialize DHT sensor
     dht.begin();
@@ -63,10 +77,10 @@ void setup() {
     // Wait for sensor to stabilize
     delay(2000);
 
-    Serial.println("Remote Temp/Humidity Monitor Initialized");
-    Serial.printlnf("Measurement interval: %d seconds", currentInterval);
-    Serial.println("Using custom interrupt-based DHT22 library");
-    Serial.println("DHT22 on D3 - External 10k pullup REQUIRED (internal disabled)");
+    Log.info("Remote Temp/Humidity Monitor Initialized");
+    Log.info("Measurement interval: %d seconds", currentInterval);
+    Log.info("Using custom interrupt-based DHT22 library");
+    Log.info("DHT22 on D3 - External 10k pullup REQUIRED (internal disabled)");
 
     // Initialize short message timer
     shortMsgStartTime = Time.now();
@@ -75,9 +89,9 @@ void setup() {
     waitFor(Particle.connected, 60000);
 
     if (Particle.connected()) {
-        Serial.println("Cloud connected!");
+        Log.info("Cloud connected!");
     } else {
-        Serial.println("WARNING: Cloud not connected");
+        Log.warn("Cloud not connected");
     }
 
     // Take first reading after 5 seconds
@@ -92,12 +106,17 @@ void loop() {
         firstRun = false;
     }
 
+    // Update reading age if we have a successful reading
+    if (lastSuccessfulReading > 0) {
+        readingAge = Time.now() - lastSuccessfulReading;
+    }
+
     // Allow system to process cloud events
     delay(100);
 }
 
 void takeMeasurement() {
-    Serial.println("\n--- Taking Measurement ---");
+    Log.info("--- Taking Measurement ---");
 
     float temperature = 0;
     float humidity = 0;
@@ -106,19 +125,19 @@ void takeMeasurement() {
     bool success = dht.read(temperature, humidity);
 
     // Debug output
-    Serial.printlnf("Raw values - Temp: %.2f°C, Humidity: %.2f%%, Success: %s",
+    Log.info("Raw values - Temp: %.2f°C, Humidity: %.2f%%, Success: %s",
                     temperature, humidity, success ? "YES" : "NO");
 
     // Check if reading was successful
     if (!success) {
-        Serial.println("ERROR: Failed to read from DHT sensor!");
-        Serial.println("Troubleshooting:");
-        Serial.println("  - Add 10kΩ resistor between DATA (D3) and 3V3");
-        Serial.println("  - Check wiring: DHT22 DATA -> D3");
-        Serial.println("  - Verify DHT22 has power (3.3V)");
-        Serial.println("  - Verify DHT22 GND is connected");
-        Serial.println("  - Ensure proper DHT22 sensor (not DHT11)");
-        Serial.println("  - Try different pin (D2, D4, D5)");
+        Log.error("Failed to read from DHT sensor!");
+        Log.info("Troubleshooting:");
+        Log.info("  - Add 10kΩ resistor between DATA (D3) and 3V3");
+        Log.info("  - Check wiring: DHT22 DATA -> D3");
+        Log.info("  - Verify DHT22 has power (3.3V)");
+        Log.info("  - Verify DHT22 GND is connected");
+        Log.info("  - Ensure proper DHT22 sensor (not DHT11)");
+        Log.info("  - Try different pin (D2, D4, D5)");
 
         // Publish error status (only if connected)
         if (Particle.connected()) {
@@ -127,9 +146,13 @@ void takeMeasurement() {
         return;
     }
 
-    // Store last values
+    // Store last values and update cloud variables
     lastTemperature = temperature;
     lastHumidity = humidity;
+    cloudTemperature = temperature;
+    cloudHumidity = humidity;
+    lastSuccessfulReading = Time.now();
+    readingAge = 0; // Just updated
 
     // Always create and store JSON format
     lastReading = createJsonPayload(temperature, humidity);
@@ -139,20 +162,20 @@ void takeMeasurement() {
         unsigned long elapsed = Time.now() - shortMsgStartTime;
         if (elapsed >= 3600) {  // 3600 seconds = 1 hour
             shortMsgEnabled = false;
-            Serial.println("INFO: Short message disabled after 1 hour");
+            Log.info("Short message disabled after 1 hour");
             if (Particle.connected()) {
                 Particle.publish("sensor/info", "Short messages disabled", PRIVATE);
             }
         }
     }
 
-    // Print to serial
-    Serial.println("✓ Reading successful!");
-    Serial.printlnf("  Temperature: %.2f°C (%.2f°F)", temperature, temperature * 9.0 / 5.0 + 32.0);
-    Serial.printlnf("  Humidity: %.2f%%", humidity);
-    Serial.printlnf("  Dew Point: %.2f°C", temperature - ((100 - humidity) / 5.0));
-    Serial.printlnf("  Short message: %s", shortMsgEnabled ? "enabled" : "disabled");
-    Serial.println("JSON: " + lastReading);
+    // Log measurement results
+    Log.info("Reading successful!");
+    Log.info("  Temperature: %.2f°C (%.2f°F)", temperature, temperature * 9.0 / 5.0 + 32.0);
+    Log.info("  Humidity: %.2f%%", humidity);
+    Log.info("  Dew Point: %.2f°C", temperature - ((100 - humidity) / 5.0));
+    Log.info("  Short message: %s", shortMsgEnabled ? "enabled" : "disabled");
+    Log.info("JSON: %s", lastReading.c_str());
 
     // Publish to cloud
     publishReading(temperature, humidity);
@@ -161,7 +184,7 @@ void takeMeasurement() {
 void publishReading(float temperature, float humidity) {
     // Check cloud connection before publishing
     if (!Particle.connected()) {
-        Serial.println("WARNING: Not connected to cloud, skipping publish");
+        Log.warn("Not connected to cloud, skipping publish");
         return;
     }
 
@@ -170,9 +193,9 @@ void publishReading(float temperature, float humidity) {
     bool jsonSuccess = Particle.publish("sensor/reading", jsonData, PRIVATE);
 
     if (jsonSuccess) {
-        Serial.println("JSON reading published successfully");
+        Log.info("JSON reading published successfully");
     } else {
-        Serial.println("ERROR: Failed to publish JSON reading");
+        Log.error("Failed to publish JSON reading");
     }
 
     // Additionally publish short message if enabled (within 1 hour)
@@ -181,9 +204,9 @@ void publishReading(float temperature, float humidity) {
         bool shortSuccess = Particle.publish("sensor/short", shortData, PRIVATE);
 
         if (shortSuccess) {
-            Serial.printlnf("Short message published: %s", shortData.c_str());
+            Log.info("Short message published: %s", shortData.c_str());
         } else {
-            Serial.println("ERROR: Failed to publish short message");
+            Log.error("Failed to publish short message");
         }
     }
 }
@@ -193,6 +216,7 @@ String createJsonPayload(float temperature, float humidity) {
     // Format: {"measurement":"environment","tags":{"location":"default","device":"boron"},"fields":{"temperature":23.5,"humidity":45.2},"timestamp":1234567890}
 
     char buffer[256];
+    memset(buffer, 0, sizeof(buffer));  // Zero out buffer first
     JSONBufferWriter writer(buffer, sizeof(buffer));
 
     writer.beginObject();
@@ -211,6 +235,9 @@ String createJsonPayload(float temperature, float humidity) {
         writer.name("timestamp").value(Time.now());
     writer.endObject();
 
+    // Ensure null termination
+    writer.buffer()[writer.dataSize()] = '\0';
+
     return String(writer.buffer());
 }
 
@@ -222,20 +249,62 @@ String createShortPayload(float temperature, float humidity) {
     return String(shortBuffer);
 }
 
+// Load measurement interval from EEPROM
+void loadIntervalFromEEPROM() {
+    uint32_t magic;
+    uint32_t storedInterval;
+
+    // Check if EEPROM has valid data by reading magic number
+    EEPROM.get(EEPROM_MAGIC_ADDR, magic);
+
+    if (magic == EEPROM_MAGIC) {
+        // Valid data exists, load the interval
+        EEPROM.get(EEPROM_INTERVAL_ADDR, storedInterval);
+
+        // Validate the loaded interval (10 seconds to 1 hour)
+        if (storedInterval >= 10 && storedInterval <= 3600) {
+            measurementInterval = storedInterval * 1000; // Convert to milliseconds
+            currentInterval = storedInterval;
+            Log.info("Loaded interval from EEPROM: %d seconds", storedInterval);
+        } else {
+            Log.warn("EEPROM interval invalid (%d), using default", storedInterval);
+        }
+    } else {
+        Log.info("No valid EEPROM data found, using default interval");
+        // Initialize EEPROM with default value
+        saveIntervalToEEPROM(currentInterval);
+    }
+}
+
+// Save measurement interval to EEPROM
+void saveIntervalToEEPROM(int intervalSeconds) {
+    uint32_t interval32 = (uint32_t)intervalSeconds;
+    uint32_t magic = EEPROM_MAGIC;
+
+    // Save interval and magic number
+    EEPROM.put(EEPROM_INTERVAL_ADDR, interval32);
+    EEPROM.put(EEPROM_MAGIC_ADDR, magic);
+
+    Log.info("Saved interval to EEPROM: %d seconds", intervalSeconds);
+}
+
 // Cloud function to set measurement interval (in seconds)
 int setInterval(String command) {
     int newInterval = command.toInt();
 
     // Validate interval (minimum 10 seconds, maximum 1 hour)
     if (newInterval < 10 || newInterval > 3600) {
-        Serial.printlnf("ERROR: Invalid interval %d seconds (must be 10-3600)", newInterval);
+        Log.error("Invalid interval %d seconds (must be 10-3600)", newInterval);
         return -1;
     }
 
     measurementInterval = newInterval * 1000; // Convert to milliseconds
     currentInterval = newInterval;
 
-    Serial.printlnf("Measurement interval updated to %d seconds", newInterval);
+    // Save to EEPROM for persistence across reboots
+    saveIntervalToEEPROM(newInterval);
+
+    Log.info("Measurement interval updated to %d seconds", newInterval);
     Particle.publish("config/interval", String(newInterval), PRIVATE);
 
     return newInterval;
@@ -243,7 +312,7 @@ int setInterval(String command) {
 
 // Cloud function to force an immediate reading
 int forceReading(String command) {
-    Serial.println("Force reading requested from cloud");
+    Log.info("Force reading requested from cloud");
     takeMeasurement();
     return 1;
 }
@@ -262,13 +331,13 @@ int enableShortMsg(String command) {
         // Enable short messages and reset timer
         shortMsgEnabled = true;
         shortMsgStartTime = Time.now();
-        Serial.println("Short messages enabled");
+        Log.info("Short messages enabled");
         Particle.publish("config/shortmsg", "enabled", PRIVATE);
         return 1;
     } else {
         // Disable short messages
         shortMsgEnabled = false;
-        Serial.println("Short messages disabled");
+        Log.info("Short messages disabled");
         Particle.publish("config/shortmsg", "disabled", PRIVATE);
         return 0;
     }

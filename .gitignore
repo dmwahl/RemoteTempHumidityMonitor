@@ -22,3 +22,6 @@ Thumbs.db
 boron_firmware_*.bin
 argon_firmware_*.bin
 photon_firmware_*.bin
+
+# Bridge configuration (contains credentials)
+bridge/docker-compose.yml

@@ -1,0 +1,23 @@
+version: '3'
+
+services:
+  particle-bridge:
+    build: .
+    container_name: particle-bridge
+    restart: unless-stopped
+    environment:
+      # Particle Cloud Configuration
+      - PARTICLE_TOKEN=your-particle-token-here
+      - DEVICE_ID=your-device-id-here
+      - EVENT_NAME=sensor/reading
+
+      # InfluxDB Configuration
+      # IMPORTANT: Use Synology IP address, NOT localhost
+      # Example: http://192.168.1.100:8086
+      - INFLUX_URL=http://your-synology-ip:8086
+      - INFLUX_TOKEN=your-influxdb-token-here
+      - INFLUX_ORG=your-org-name
+      - INFLUX_BUCKET=your-bucket-name
+
+    # Use bridge networking (default)
+    network_mode: bridge

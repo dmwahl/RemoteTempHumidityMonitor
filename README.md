@@ -115,9 +115,33 @@ curl https://api.particle.io/v1/devices/<device-id>/forceReading \
 
 ### Cloud Variables
 
-Two read-only variables for monitoring:
+Five read-only variables for monitoring:
 
-#### `lastReading` - Most Recent Sensor Data
+#### `temperature` - Latest Temperature Reading
+
+```bash
+particle get <device-name> temperature
+```
+
+Returns temperature in Celsius (e.g., `22.5`)
+
+#### `humidity` - Latest Humidity Reading
+
+```bash
+particle get <device-name> humidity
+```
+
+Returns humidity percentage (e.g., `39.1`)
+
+#### `readingAge` - Time Since Last Successful Reading
+
+```bash
+particle get <device-name> readingAge
+```
+
+Returns seconds since last successful reading (e.g., `45`)
+
+#### `lastReading` - Most Recent Sensor Data (JSON)
 
 ```bash
 particle get <device-name> lastReading
@@ -146,6 +170,8 @@ particle get <device-name> intervalSec
 ```
 
 Returns interval in seconds (e.g., `10`)
+
+**Note:** The measurement interval is persisted to EEPROM and survives device reboots.
 
 ### Published Events
 
@@ -220,10 +246,34 @@ Choose the integration method based on your network setup:
 - Networks where exposing services is not allowed
 
 Since the Particle device publishes events to Particle Cloud, but your InfluxDB is not accessible from the internet, you need a bridge service running on your local network that:
-1. Makes **outbound** connection to Particle Cloud (subscribes to event stream)
+1. Makes **outbound** connection to Particle Cloud (subscribes to event stream via Server-Sent Events)
 2. Writes to local InfluxDB (internal connection)
 
-#### Option A: Node.js Bridge Service
+**✅ This project includes a ready-to-use Python bridge service in the `bridge/` directory with Docker deployment support.**
+
+See the complete setup guide in [bridge/README.md](bridge/README.md) for step-by-step Synology deployment instructions.
+
+#### Quick Start with Included Bridge Service
+
+The `bridge/` directory contains:
+- `particle-bridge.py` - Python service that connects Particle Cloud to InfluxDB
+- `Dockerfile` - Container definition
+- `docker-compose.yml.example` - Template configuration
+- `README.md` - Complete deployment guide
+
+**Basic setup:**
+1. Copy `docker-compose.yml.example` to `docker-compose.yml`
+2. Edit environment variables with your credentials
+3. Deploy to Synology Container Manager or run with `docker-compose up -d`
+
+**Key features:**
+- Automatic reconnection on connection loss
+- Manual SSE parsing (no external dependencies beyond requests and influxdb-client)
+- Correct timestamp conversion (seconds → nanoseconds for InfluxDB)
+- Event filtering to process only sensor readings
+- Detailed logging for troubleshooting
+
+#### Option A: Node.js Bridge Service (Alternative)
 
 Create a bridge service that runs on your local network:
 
@@ -289,86 +339,6 @@ npm install particle-api-js @influxdata/influxdb-client
 node bridge.js
 ```
 
-#### Option B: Python Bridge Service
-
-```python
-from particle import ParticleCloud
-from influxdb_client import InfluxDBClient, Point
-from influxdb_client.client.write_api import SYNCHRONOUS
-import json
-
-# Particle configuration
-PARTICLE_TOKEN = 'your-particle-token'
-DEVICE_ID = 'your-device-id'
-
-# InfluxDB configuration (local network)
-influx_client = InfluxDBClient(
-    url='http://localhost:8086',  # or your local InfluxDB IP
-    token='your-local-influxdb-token',
-    org='your-org'
-)
-write_api = influx_client.write_api(write_options=SYNCHRONOUS)
-
-# Connect to Particle Cloud
-cloud = ParticleCloud(PARTICLE_TOKEN)
-
-def event_handler(event):
-    try:
-        data = json.loads(event.data)
-
-        # Create InfluxDB point
-        point = Point(data['measurement']) \
-            .tag('location', data['tags']['location']) \
-            .tag('device', data['tags']['device']) \
-            .field('temperature', float(data['fields']['temperature'])) \
-            .field('humidity', float(data['fields']['humidity'])) \
-            .time(data['timestamp'])
-
-        # Write to InfluxDB
-        write_api.write(bucket='your-bucket', record=point)
-        print(f"Written: {data['fields']['temperature']}°C, {data['fields']['humidity']}%")
-
-    except Exception as e:
-        print(f"Error: {e}")
-
-# Subscribe to events
-device = cloud.devices.get(DEVICE_ID)
-stream = cloud.subscribe('sensor/reading', event_handler)
-
-print('Listening for events...')
-stream.start()
-```
-
-**Installation:**
-```bash
-pip install particle-cloud influxdb-client
-python bridge.py
-```
-
-#### Option C: Docker Container
-
-Run the bridge as a Docker container on your local network:
-
-```dockerfile
-# Dockerfile
-FROM node:18-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install
-COPY bridge.js .
-CMD ["node", "bridge.js"]
-```
-
-```bash
-docker build -t particle-influx-bridge .
-docker run -d --restart=unless-stopped \
-  -e PARTICLE_TOKEN=your-token \
-  -e DEVICE_ID=your-device-id \
-  -e INFLUX_URL=http://your-influxdb:8086 \
-  -e INFLUX_TOKEN=your-token \
-  --name particle-bridge \
-  particle-influx-bridge
-```
 
 ### Method 3: Telegraf with HTTP Listener + Particle Webhook
 
@@ -563,17 +533,93 @@ Poll the Particle Cloud API periodically from your local network:
   influx write -b your-bucket -o your-org -
 ```
 
-### Grafana Dashboard
+### Grafana Dashboard Setup
 
-Sample InfluxDB query (Flux):
+After data is flowing into InfluxDB, set up Grafana visualization:
 
+#### Step 1: Add InfluxDB Data Source
+
+1. Open Grafana (usually `http://your-server:3000`)
+2. Navigate to **Configuration** → **Data Sources**
+3. Click **Add data source** → Select **InfluxDB**
+4. Configure:
+   - **Query Language**: `Flux` (important!)
+   - **URL**: `http://your-influxdb-server:8086`
+   - **Access**: `Server (default)`
+   - **Organization**: Your InfluxDB org name
+   - **Token**: Your InfluxDB API token
+   - **Default Bucket**: Your bucket name
+5. Click **Save & Test** (should show green checkmark)
+
+#### Step 2: Create Dashboard
+
+1. Click **+** → **Dashboard** → **Add visualization**
+2. Select your InfluxDB data source
+3. Switch to **Code** mode in query editor
+
+**Temperature Panel Query:**
 ```flux
 from(bucket: "your-bucket")
-  |> range(start: -24h)
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
   |> filter(fn: (r) => r._measurement == "environment")
-  |> filter(fn: (r) => r._field == "temperature" or r._field == "humidity")
-  |> filter(fn: (r) => r.device == "your-device-id")
+  |> filter(fn: (r) => r._field == "temperature")
 ```
+
+**Panel Settings:**
+- Title: `Temperature`
+- Unit: `Temperature` → `Celsius (°C)`
+- Min/Max: Auto or set custom range
+
+**Humidity Panel Query:**
+```flux
+from(bucket: "your-bucket")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r._measurement == "environment")
+  |> filter(fn: (r) => r._field == "humidity")
+```
+
+**Panel Settings:**
+- Title: `Humidity`
+- Unit: `Percent (0-100)`
+- Min: `0`, Max: `100`
+
+4. Arrange panels and save dashboard
+
+#### Step 3: Verify Data Flow
+
+After deployment, verify the complete pipeline:
+
+1. **Trigger test reading:**
+   ```bash
+   particle call <device-name> forceReading
+   ```
+
+2. **Check bridge logs** (should show):
+   ```
+   [timestamp] Valid sensor reading found!
+   [timestamp] ✓ Written: 22.5°C, 39.1%
+   ```
+
+3. **Query InfluxDB** to confirm data:
+   ```flux
+   from(bucket: "your-bucket")
+     |> range(start: -1h)
+     |> filter(fn: (r) => r._measurement == "environment")
+   ```
+
+4. **View in Grafana** - data should appear in your dashboard
+
+#### Common Grafana Issues
+
+**"No data" in dashboard:**
+- Verify data exists in InfluxDB first (use InfluxDB UI Data Explorer)
+- Check time range selector (top right) - ensure it covers your data timeframe
+- Verify query syntax in panel (click query inspector for errors)
+
+**Wrong timestamp range:**
+- The bridge converts Unix timestamps (seconds) to nanoseconds for InfluxDB
+- If using old data before timestamp fix, it may be timestamped in 2025
+- Force new readings to populate correct current data
 
 ## Technical Details
 
@@ -714,12 +760,16 @@ RemoteTempHumidityMonitor/
 │   ├── RemoteTempHumidityMonitor.ino  # Main application
 │   ├── SimpleDHT22.h                   # Custom DHT22 library header
 │   └── SimpleDHT22.cpp                 # Custom DHT22 library implementation
+├── bridge/
+│   ├── particle-bridge.py             # Python bridge service
+│   ├── Dockerfile                     # Docker container definition
+│   ├── docker-compose.yml.example     # Docker Compose template
+│   └── README.md                      # Bridge deployment guide
 ├── project.properties                  # Particle project configuration
 ├── WIRING.md                          # Detailed wiring diagrams
 ├── README.md                          # This file
 ├── .gitignore                         # Git ignore rules
 └── LICENSE                            # MIT License
-
 ```
 
 ## JSON Data Format

@@ -82,6 +82,8 @@ def process_event(event_data):
 def main():
     retry_delay = 5
     max_retry_delay = 60
+    last_event_time = time.time()
+    connection_timeout = 630  # 10.5 minutes - reconnect if no data received
 
     while True:
         try:
@@ -89,16 +91,24 @@ def main():
             print(f"URL: {url.replace(PARTICLE_TOKEN, 'REDACTED')}")
 
             # Subscribe to Particle event stream via SSE using requests
-            response = requests.get(url, stream=True, headers={'Accept': 'text/event-stream'})
+            # Set timeout to detect stalled connections
+            response = requests.get(url, stream=True, headers={'Accept': 'text/event-stream'}, timeout=30)
             response.raise_for_status()
 
             print('✓ Connected! Listening for events...')
             retry_delay = 5  # Reset retry delay on successful connection
+            last_event_time = time.time()  # Reset event timer
 
             # Process SSE stream manually
             buffer = ''
             for chunk in response.iter_content(chunk_size=1, decode_unicode=True):
+                # Check for connection timeout (no data received for too long)
+                if time.time() - last_event_time > connection_timeout:
+                    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"[{timestamp}] No data received for {connection_timeout}s, reconnecting...")
+                    break  # Exit the loop to trigger reconnection
                 if chunk:
+                    last_event_time = time.time()  # Update last activity time
                     buffer += chunk
                     if '\n\n' in buffer:
                         # SSE messages are separated by double newlines
@@ -146,6 +156,10 @@ def main():
                                     except json.JSONDecodeError as e:
                                         print(f"[{timestamp}] Failed to parse event wrapper: {e}")
                                         pass
+
+            # If we exit the loop normally (not via exception), it means connection was idle
+            # Close the response to ensure clean disconnect
+            response.close()
 
         except KeyboardInterrupt:
             print("\nShutting down...")

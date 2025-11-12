@@ -33,6 +33,7 @@ unsigned long lastSuccessfulReading = 0; // Timestamp of last successful reading
 float lastTemperature = 0.0;
 float lastHumidity = 0.0;
 bool firstRun = true;
+bool hasValidLastReading = false; // Track if we have a valid previous reading
 
 // Cloud variables (read-only from cloud)
 String lastReading = "{}";
@@ -128,25 +129,78 @@ void takeMeasurement() {
     Log.info("Raw values - Temp: %.2f°C, Humidity: %.2f%%, Success: %s",
                     temperature, humidity, success ? "YES" : "NO");
 
-    // Check if reading was successful
+    // Check if reading was successful - retry once if failed
     if (!success) {
-        Log.error("Failed to read from DHT sensor!");
-        Log.info("Troubleshooting:");
-        Log.info("  - Add 10kΩ resistor between DATA (D3) and 3V3");
-        Log.info("  - Check wiring: DHT22 DATA -> D3");
-        Log.info("  - Verify DHT22 has power (3.3V)");
-        Log.info("  - Verify DHT22 GND is connected");
-        Log.info("  - Ensure proper DHT22 sensor (not DHT11)");
-        Log.info("  - Try different pin (D2, D4, D5)");
+        Log.warn("Initial DHT22 read failed, retrying once...");
 
-        // Publish error status (only if connected)
-        if (Particle.connected()) {
-            Particle.publish("sensor/error", "DHT22 read failed", PRIVATE);
+        // Wait 2 seconds before retry (DHT22 requirement)
+        delay(2000);
+
+        // Retry reading
+        success = dht.read(temperature, humidity);
+        Log.info("Retry values - Temp: %.2f°C, Humidity: %.2f%%, Success: %s",
+                        temperature, humidity, success ? "YES" : "NO");
+
+        if (!success) {
+            Log.error("DHT22 read failed after retry!");
+            Log.info("Troubleshooting:");
+            Log.info("  - Add 10kΩ resistor between DATA (D3) and 3V3");
+            Log.info("  - Check wiring: DHT22 DATA -> D3");
+            Log.info("  - Verify DHT22 has power (3.3V)");
+            Log.info("  - Verify DHT22 GND is connected");
+            Log.info("  - Ensure proper DHT22 sensor (not DHT11)");
+            Log.info("  - Try different pin (D2, D4, D5)");
+
+            // Publish error status (only if connected)
+            if (Particle.connected()) {
+                Particle.publish("sensor/error", "DHT22 read failed", PRIVATE);
+            }
+            return;
+        } else {
+            Log.info("Retry read succeeded!");
         }
-        return;
+    }
+
+    // Validate temperature jump (only if we have a previous reading)
+    if (hasValidLastReading) {
+        float tempDiff = abs(temperature - lastTemperature);
+        if (tempDiff > 1.0) {
+            Log.warn("Temperature jump detected: %.2f°C -> %.2f°C (diff: %.2f°C)",
+                     lastTemperature, temperature, tempDiff);
+            Log.warn("Discarding and re-reading once...");
+
+            // Wait 2 seconds (DHT22 requirement)
+            delay(2000);
+
+            // Retry reading once
+            float retryTemp = 0;
+            float retryHumidity = 0;
+            bool retrySuccess = dht.read(retryTemp, retryHumidity);
+
+            if (retrySuccess) {
+                float retryDiff = abs(retryTemp - lastTemperature);
+                Log.info("Retry read: %.2f°C (diff from last: %.2f°C)", retryTemp, retryDiff);
+
+                if (retryDiff <= 1.0) {
+                    // Retry reading is valid, use it
+                    Log.info("Retry reading is valid, using it");
+                    temperature = retryTemp;
+                    humidity = retryHumidity;
+                } else {
+                    // Both readings show large jump, accept the retry value
+                    Log.warn("Retry still shows large jump (%.2f°C), accepting anyway", retryDiff);
+                    temperature = retryTemp;
+                    humidity = retryHumidity;
+                }
+            } else {
+                // Retry failed, accept original reading
+                Log.warn("Retry read failed, accepting original reading");
+            }
+        }
     }
 
     // Store last values and update cloud variables
+    hasValidLastReading = true;
     lastTemperature = temperature;
     lastHumidity = humidity;
     cloudTemperature = temperature;

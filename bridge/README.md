@@ -2,6 +2,8 @@
 
 This bridge service subscribes to Particle Cloud events and writes sensor data to your local InfluxDB instance.
 
+**Version:** 1.1.0
+
 ## Network Requirements
 
 - ✅ **No inbound connections required**
@@ -157,3 +159,17 @@ The bridge:
 - Auto-restarts if it crashes
 - Auto-starts on Synology boot
 - Runs 24/7 processing events in real-time
+- Connection health monitoring (630s timeout with automatic reconnection)
+- Handles network interruptions gracefully
+
+## Version History
+
+### v1.1.0
+- Added connection health monitoring with 630-second timeout
+- Automatic reconnection on network loss or stalled connections
+- Improved resilience for internet outages
+
+### v1.0.0
+- Initial release with SSE parsing and InfluxDB integration
+- Timestamp conversion (seconds → nanoseconds)
+- Event filtering and validation

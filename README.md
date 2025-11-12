@@ -847,6 +847,19 @@ David Wahl
 
 ---
 
-**Version:** 1.0.0
-**Last Updated:** 2025-01-18
+**Firmware Version:** 1.1.0
+**Bridge Version:** 1.1.0
+**Last Updated:** 2025-01-29
 **Compatible Device OS:** 6.x
+
+## Recent Updates (v1.1.0)
+
+### Firmware
+- Added temperature jump validation (>1°C changes trigger retry)
+- Prevents sensor glitches from being recorded
+- Single automatic retry with intelligent decision logic
+
+### Bridge Service
+- Connection health monitoring with 630-second timeout
+- Automatic reconnection on network loss or stalled connections
+- Improved resilience for internet outages and network disruptions

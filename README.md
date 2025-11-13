@@ -9,9 +9,11 @@ A cloud-connected temperature and humidity monitoring system for Particle Boron 
 ## Features
 
 - ✅ **Precise Hardware Timing** - nRF52840 hardware timer (1µs resolution) for reliable DHT22 communication
+- ✅ **Moving Average Filtering** - Measurements every 10 seconds with configurable publish interval (default 300s)
+- ✅ **Smart Publishing** - Publishes when temperature changes ≥0.25°C OR 5× interval elapsed
+- ✅ **Temperature Validation** - Automatic retry on >1°C jumps to filter sensor glitches
 - ✅ **Automatic Retry Logic** - Automatically retries failed reads once before reporting error
 - ✅ **Cloud Connected** - Real-time data access via Particle Cloud
-- ✅ **Configurable Interval** - Adjustable measurement interval (10-3600 seconds) via cloud functions
 - ✅ **InfluxDB Compatible** - JSON output format ready for InfluxDB/Grafana
 - ✅ **Remote Control** - Cloud functions for interval adjustment and forced readings
 - ✅ **Low Overhead** - Efficient custom DHT22 library optimized for Gen3 devices
@@ -79,26 +81,27 @@ particle flash <device-name> src/
 
 ### Cloud Functions
 
-The device exposes two cloud functions:
+The device exposes three cloud functions:
 
-#### `setInterval` - Change Measurement Interval
+#### `setInterval` - Change Publish Interval
 
-Change how often measurements are taken (10-3600 seconds).
+Change how often data is published to the cloud (30-3600 seconds). Note: Measurements are always taken every 10 seconds, but publishing is controlled by this interval along with the 0.25°C change threshold.
 
 ```bash
 # Via Particle CLI
-particle call <device-name> setInterval 60
+particle call <device-name> setInterval 300
 
 # Via API
 curl https://api.particle.io/v1/devices/<device-id>/setInterval \
   -d access_token=<token> \
-  -d arg=60
+  -d arg=300
 ```
 
 **Parameters:**
-- Range: 10 - 3600 seconds
-- Default: 10 seconds
+- Range: 30 - 3600 seconds
+- Default: 300 seconds (5 minutes)
 - Returns: New interval value or -1 on error
+- Note: Buffer size automatically adjusts to match new interval
 
 #### `forceReading` - Trigger Immediate Reading
 
@@ -847,19 +850,22 @@ David Wahl
 
 ---
 
-**Firmware Version:** 1.1.0
+**Firmware Version:** 1.2.0
 **Bridge Version:** 1.1.0
 **Last Updated:** 2025-01-29
 **Compatible Device OS:** 6.x
 
-## Recent Updates (v1.1.0)
+## Recent Updates (v1.2.0)
 
 ### Firmware
-- Added temperature jump validation (>1°C changes trigger retry)
-- Prevents sensor glitches from being recorded
-- Single automatic retry with intelligent decision logic
+- **Moving Average System:** Measurements taken every 10 seconds with configurable publish interval (default 300s)
+- **Dynamic Buffer:** Buffer size automatically calculated based on publish interval
+- **Smart Publishing:** Publishes when temperature changes ≥0.25°C OR 5× publish interval elapsed
+- **Temperature Validation:** >1°C changes trigger automatic retry
+- **Sensor Reliability:** DHT22 read failures trigger automatic retry before error reporting
 
-### Bridge Service
-- Connection health monitoring with 630-second timeout
-- Automatic reconnection on network loss or stalled connections
-- Improved resilience for internet outages and network disruptions
+### Previous Updates (v1.1.0)
+- Temperature jump validation (>1°C changes trigger retry)
+- DHT22 read failure retry
+- Bridge connection health monitoring with 630-second timeout
+- Automatic reconnection on network loss

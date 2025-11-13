@@ -16,9 +16,9 @@
 #define DHTPIN D3
 
 // EEPROM Configuration
-#define EEPROM_INTERVAL_ADDR 0  // Address to store measurement interval
-#define EEPROM_MAGIC_ADDR 4     // Address to store magic number (validation)
-#define EEPROM_MAGIC 0xA5B4C3D2 // Magic number to validate EEPROM data
+#define EEPROM_PUBLISH_INTERVAL_ADDR 0  // Address to store publish interval
+#define EEPROM_MAGIC_ADDR 4             // Address to store magic number (validation)
+#define EEPROM_MAGIC 0xA5B4C3D2         // Magic number to validate EEPROM data
 
 // System mode - Use AUTOMATIC for reliable cloud connection
 SYSTEM_MODE(AUTOMATIC);
@@ -26,51 +26,73 @@ SYSTEM_MODE(AUTOMATIC);
 // DHT sensor object - using custom interrupt-based library
 SimpleDHT22 dht(DHTPIN);
 
-// Global variables
-unsigned long measurementInterval = 10000; // Default 10 seconds in milliseconds
+// Timing Configuration
+const unsigned long MEASUREMENT_INTERVAL = 10000; // Fixed 10 seconds in milliseconds
+unsigned long publishInterval = 300; // Default 300 seconds (5 minutes), configurable
 unsigned long lastMeasurement = 0;
-unsigned long lastSuccessfulReading = 0; // Timestamp of last successful reading
-float lastTemperature = 0.0;
-float lastHumidity = 0.0;
-bool firstRun = true;
+unsigned long lastPublishTime = 0; // Track when we last published
+
+// Moving Average Buffer
+#define MAX_BUFFER_SIZE 360 // Maximum buffer size (3600s / 10s = 360 readings max)
+float tempBuffer[MAX_BUFFER_SIZE];
+float humidityBuffer[MAX_BUFFER_SIZE];
+int bufferSize = 30; // Default buffer size (300s / 10s = 30 readings)
+int bufferIndex = 0;
+int bufferCount = 0; // Number of valid readings in buffer
+
+// Sensor State
+float lastValidatedTemp = 0.0; // Last temperature that passed validation
+float lastValidatedHumidity = 0.0; // Last humidity that passed validation
+float lastPublishedTemp = 0.0; // Last temperature we published
+float lastPublishedHumidity = 0.0; // Last humidity we published
 bool hasValidLastReading = false; // Track if we have a valid previous reading
+bool firstRun = true;
 
 // Cloud variables (read-only from cloud)
 String lastReading = "{}";
-int currentInterval = 10; // In seconds for easier cloud reading
+int currentPublishInterval = 300; // Publish interval in seconds for cloud reading
 bool shortMsgEnabled = true; // Short message enabled status
 unsigned long shortMsgStartTime = 0; // Track when short messages started (0 = not started)
-double cloudTemperature = 0.0; // Cloud-accessible temperature value
-double cloudHumidity = 0.0; // Cloud-accessible humidity value
-int readingAge = 0; // Age of last reading in seconds
+double cloudTemperature = 0.0; // Cloud-accessible temperature value (moving average)
+double cloudHumidity = 0.0; // Cloud-accessible humidity value (moving average)
+int readingAge = 0; // Age of last publish in seconds
+int bufferFillPercent = 0; // Percentage of buffer filled (for monitoring)
 
 // Function prototypes
 void takeMeasurement();
+void addToMovingAverage(float temperature, float humidity);
+float calculateMovingAverage(float* buffer, int count);
+bool shouldPublish(float avgTemp, float avgHumidity);
 void publishReading(float temperature, float humidity);
 String createJsonPayload(float temperature, float humidity);
 String createShortPayload(float temperature, float humidity);
-void loadIntervalFromEEPROM();
-void saveIntervalToEEPROM(int intervalSeconds);
-int setInterval(String command);
+void loadPublishIntervalFromEEPROM();
+void savePublishIntervalToEEPROM(int intervalSeconds);
+void updateBufferSize();
+int setPublishInterval(String command);
 int forceReading(String command);
 int enableShortMsg(String command);
 
 void setup() {
-    // Load saved measurement interval from EEPROM
-    loadIntervalFromEEPROM();
+    // Load saved publish interval from EEPROM
+    loadPublishIntervalFromEEPROM();
+
+    // Calculate buffer size based on publish interval
+    updateBufferSize();
 
     // Register cloud functions (must be done in setup before cloud connects)
-    Particle.function("setInterval", setInterval);
+    Particle.function("setInterval", setPublishInterval);
     Particle.function("forceReading", forceReading);
     Particle.function("enableShort", enableShortMsg);
 
     // Register cloud variables
     Particle.variable("lastReading", lastReading);
-    Particle.variable("intervalSec", currentInterval);
+    Particle.variable("publishSec", currentPublishInterval);
     Particle.variable("shortMsg", shortMsgEnabled);
     Particle.variable("temperature", cloudTemperature);
     Particle.variable("humidity", cloudHumidity);
     Particle.variable("readingAge", readingAge);
+    Particle.variable("bufferFill", bufferFillPercent);
 
     // Initialize DHT sensor
     dht.begin();
@@ -78,8 +100,10 @@ void setup() {
     // Wait for sensor to stabilize
     delay(2000);
 
-    Log.info("Remote Temp/Humidity Monitor Initialized");
-    Log.info("Measurement interval: %d seconds", currentInterval);
+    Log.info("Remote Temp/Humidity Monitor v1.2.0");
+    Log.info("Measurement interval: 10 seconds (fixed)");
+    Log.info("Publish interval: %d seconds", currentPublishInterval);
+    Log.info("Moving average buffer size: %d readings", bufferSize);
     Log.info("Using custom interrupt-based DHT22 library");
     Log.info("DHT22 on D3 - External 10k pullup REQUIRED (internal disabled)");
 
@@ -95,21 +119,24 @@ void setup() {
         Log.warn("Cloud not connected");
     }
 
+    // Initialize publish timer
+    lastPublishTime = Time.now();
+
     // Take first reading after 5 seconds
-    lastMeasurement = millis() - measurementInterval + 5000;
+    lastMeasurement = millis() - MEASUREMENT_INTERVAL + 5000;
 }
 
 void loop() {
-    // Check if it's time for a measurement
-    if (millis() - lastMeasurement >= measurementInterval || firstRun) {
+    // Check if it's time for a measurement (every 10 seconds)
+    if (millis() - lastMeasurement >= MEASUREMENT_INTERVAL || firstRun) {
         takeMeasurement();
         lastMeasurement = millis();
         firstRun = false;
     }
 
-    // Update reading age if we have a successful reading
-    if (lastSuccessfulReading > 0) {
-        readingAge = Time.now() - lastSuccessfulReading;
+    // Update reading age (time since last publish)
+    if (lastPublishTime > 0) {
+        readingAge = Time.now() - lastPublishTime;
     }
 
     // Allow system to process cloud events
@@ -163,10 +190,10 @@ void takeMeasurement() {
 
     // Validate temperature jump (only if we have a previous reading)
     if (hasValidLastReading) {
-        float tempDiff = abs(temperature - lastTemperature);
+        float tempDiff = abs(temperature - lastValidatedTemp);
         if (tempDiff > 1.0) {
             Log.warn("Temperature jump detected: %.2f°C -> %.2f°C (diff: %.2f°C)",
-                     lastTemperature, temperature, tempDiff);
+                     lastValidatedTemp, temperature, tempDiff);
             Log.warn("Discarding and re-reading once...");
 
             // Wait 2 seconds (DHT22 requirement)
@@ -178,7 +205,7 @@ void takeMeasurement() {
             bool retrySuccess = dht.read(retryTemp, retryHumidity);
 
             if (retrySuccess) {
-                float retryDiff = abs(retryTemp - lastTemperature);
+                float retryDiff = abs(retryTemp - lastValidatedTemp);
                 Log.info("Retry read: %.2f°C (diff from last: %.2f°C)", retryTemp, retryDiff);
 
                 if (retryDiff <= 1.0) {
@@ -199,40 +226,53 @@ void takeMeasurement() {
         }
     }
 
-    // Store last values and update cloud variables
+    // Store validated reading
     hasValidLastReading = true;
-    lastTemperature = temperature;
-    lastHumidity = humidity;
-    cloudTemperature = temperature;
-    cloudHumidity = humidity;
-    lastSuccessfulReading = Time.now();
-    readingAge = 0; // Just updated
+    lastValidatedTemp = temperature;
+    lastValidatedHumidity = humidity;
 
-    // Always create and store JSON format
-    lastReading = createJsonPayload(temperature, humidity);
+    // Add to moving average buffer
+    addToMovingAverage(temperature, humidity);
 
-    // Check if short message should be disabled (after 1 hour)
-    if (shortMsgEnabled && shortMsgStartTime > 0) {
-        unsigned long elapsed = Time.now() - shortMsgStartTime;
-        if (elapsed >= 3600) {  // 3600 seconds = 1 hour
-            shortMsgEnabled = false;
-            Log.info("Short message disabled after 1 hour");
-            if (Particle.connected()) {
-                Particle.publish("sensor/info", "Short messages disabled", PRIVATE);
-            }
-        }
-    }
+    // Calculate moving averages
+    float avgTemp = calculateMovingAverage(tempBuffer, bufferCount);
+    float avgHumidity = calculateMovingAverage(humidityBuffer, bufferCount);
+
+    // Update cloud variables with moving averages
+    cloudTemperature = avgTemp;
+    cloudHumidity = avgHumidity;
 
     // Log measurement results
     Log.info("Reading successful!");
     Log.info("  Temperature: %.2f°C (%.2f°F)", temperature, temperature * 9.0 / 5.0 + 32.0);
     Log.info("  Humidity: %.2f%%", humidity);
-    Log.info("  Dew Point: %.2f°C", temperature - ((100 - humidity) / 5.0));
-    Log.info("  Short message: %s", shortMsgEnabled ? "enabled" : "disabled");
-    Log.info("JSON: %s", lastReading.c_str());
+    Log.info("  Moving avg temp: %.2f°C, humidity: %.2f%%", avgTemp, avgHumidity);
+    Log.info("  Buffer: %d/%d readings (%.0f%% full)", bufferCount, bufferSize, bufferFillPercent);
 
-    // Publish to cloud
-    publishReading(temperature, humidity);
+    // Check if we should publish
+    if (shouldPublish(avgTemp, avgHumidity)) {
+        // Update last reading JSON
+        lastReading = createJsonPayload(avgTemp, avgHumidity);
+
+        // Check if short message should be disabled (after 1 hour)
+        if (shortMsgEnabled && shortMsgStartTime > 0) {
+            unsigned long elapsed = Time.now() - shortMsgStartTime;
+            if (elapsed >= 3600) {  // 3600 seconds = 1 hour
+                shortMsgEnabled = false;
+                Log.info("Short message disabled after 1 hour");
+                if (Particle.connected()) {
+                    Particle.publish("sensor/info", "Short messages disabled", PRIVATE);
+                }
+            }
+        }
+
+        publishReading(avgTemp, avgHumidity);
+        lastPublishedTemp = avgTemp;
+        lastPublishedHumidity = avgHumidity;
+        lastPublishTime = Time.now();
+    } else {
+        Log.info("Skipping publish (no significant change)");
+    }
 }
 
 void publishReading(float temperature, float humidity) {
@@ -303,8 +343,66 @@ String createShortPayload(float temperature, float humidity) {
     return String(shortBuffer);
 }
 
-// Load measurement interval from EEPROM
-void loadIntervalFromEEPROM() {
+// Add reading to moving average buffer
+void addToMovingAverage(float temperature, float humidity) {
+    // Add to circular buffer
+    tempBuffer[bufferIndex] = temperature;
+    humidityBuffer[bufferIndex] = humidity;
+
+    // Update index (circular buffer)
+    bufferIndex = (bufferIndex + 1) % bufferSize;
+
+    // Update count (up to bufferSize)
+    if (bufferCount < bufferSize) {
+        bufferCount++;
+    }
+
+    // Update buffer fill percentage
+    bufferFillPercent = (bufferCount * 100) / bufferSize;
+}
+
+// Calculate moving average from buffer
+float calculateMovingAverage(float* buffer, int count) {
+    if (count == 0) return 0.0;
+
+    float sum = 0.0;
+    for (int i = 0; i < count; i++) {
+        sum += buffer[i];
+    }
+    return sum / count;
+}
+
+// Determine if we should publish based on temperature change or time elapsed
+bool shouldPublish(float avgTemp, float avgHumidity) {
+    // Always publish the first reading
+    if (lastPublishTime == 0) {
+        Log.info("Publishing first reading");
+        return true;
+    }
+
+    // Calculate time since last publish
+    unsigned long timeSincePublish = Time.now() - lastPublishTime;
+
+    // Check if 5x publish interval has elapsed (force publish)
+    if (timeSincePublish >= (publishInterval * 5)) {
+        Log.info("Publishing: 5x interval elapsed (%lu >= %lu seconds)",
+                 timeSincePublish, publishInterval * 5);
+        return true;
+    }
+
+    // Check if temperature changed by >= 0.25°C
+    float tempChange = abs(avgTemp - lastPublishedTemp);
+    if (tempChange >= 0.25) {
+        Log.info("Publishing: temp changed %.2f°C (>= 0.25°C)", tempChange);
+        return true;
+    }
+
+    // No significant change
+    return false;
+}
+
+// Load publish interval from EEPROM
+void loadPublishIntervalFromEEPROM() {
     uint32_t magic;
     uint32_t storedInterval;
 
@@ -313,52 +411,69 @@ void loadIntervalFromEEPROM() {
 
     if (magic == EEPROM_MAGIC) {
         // Valid data exists, load the interval
-        EEPROM.get(EEPROM_INTERVAL_ADDR, storedInterval);
+        EEPROM.get(EEPROM_PUBLISH_INTERVAL_ADDR, storedInterval);
 
-        // Validate the loaded interval (10 seconds to 1 hour)
-        if (storedInterval >= 10 && storedInterval <= 3600) {
-            measurementInterval = storedInterval * 1000; // Convert to milliseconds
-            currentInterval = storedInterval;
-            Log.info("Loaded interval from EEPROM: %d seconds", storedInterval);
+        // Validate the loaded interval (30 seconds to 1 hour)
+        if (storedInterval >= 30 && storedInterval <= 3600) {
+            publishInterval = storedInterval;
+            currentPublishInterval = storedInterval;
+            Log.info("Loaded publish interval from EEPROM: %d seconds", storedInterval);
         } else {
-            Log.warn("EEPROM interval invalid (%d), using default", storedInterval);
+            Log.warn("EEPROM publish interval invalid (%d), using default", storedInterval);
         }
     } else {
-        Log.info("No valid EEPROM data found, using default interval");
+        Log.info("No valid EEPROM data found, using default publish interval");
         // Initialize EEPROM with default value
-        saveIntervalToEEPROM(currentInterval);
+        savePublishIntervalToEEPROM(currentPublishInterval);
     }
 }
 
-// Save measurement interval to EEPROM
-void saveIntervalToEEPROM(int intervalSeconds) {
+// Save publish interval to EEPROM
+void savePublishIntervalToEEPROM(int intervalSeconds) {
     uint32_t interval32 = (uint32_t)intervalSeconds;
     uint32_t magic = EEPROM_MAGIC;
 
     // Save interval and magic number
-    EEPROM.put(EEPROM_INTERVAL_ADDR, interval32);
+    EEPROM.put(EEPROM_PUBLISH_INTERVAL_ADDR, interval32);
     EEPROM.put(EEPROM_MAGIC_ADDR, magic);
 
-    Log.info("Saved interval to EEPROM: %d seconds", intervalSeconds);
+    Log.info("Saved publish interval to EEPROM: %d seconds", intervalSeconds);
 }
 
-// Cloud function to set measurement interval (in seconds)
-int setInterval(String command) {
+// Update buffer size based on publish interval
+void updateBufferSize() {
+    // Buffer size = publishInterval / 10 seconds (measurement interval)
+    // Minimum 3 readings, maximum 360 readings
+    int newBufferSize = publishInterval / 10;
+    if (newBufferSize < 3) newBufferSize = 3;
+    if (newBufferSize > MAX_BUFFER_SIZE) newBufferSize = MAX_BUFFER_SIZE;
+
+    bufferSize = newBufferSize;
+    bufferFillPercent = (bufferCount * 100) / bufferSize;
+
+    Log.info("Buffer size updated to %d readings", bufferSize);
+}
+
+// Cloud function to set publish interval (in seconds)
+int setPublishInterval(String command) {
     int newInterval = command.toInt();
 
-    // Validate interval (minimum 10 seconds, maximum 1 hour)
-    if (newInterval < 10 || newInterval > 3600) {
-        Log.error("Invalid interval %d seconds (must be 10-3600)", newInterval);
+    // Validate interval (minimum 30 seconds, maximum 1 hour)
+    if (newInterval < 30 || newInterval > 3600) {
+        Log.error("Invalid publish interval %d seconds (must be 30-3600)", newInterval);
         return -1;
     }
 
-    measurementInterval = newInterval * 1000; // Convert to milliseconds
-    currentInterval = newInterval;
+    publishInterval = newInterval;
+    currentPublishInterval = newInterval;
+
+    // Update buffer size to match new interval
+    updateBufferSize();
 
     // Save to EEPROM for persistence across reboots
-    saveIntervalToEEPROM(newInterval);
+    savePublishIntervalToEEPROM(newInterval);
 
-    Log.info("Measurement interval updated to %d seconds", newInterval);
+    Log.info("Publish interval updated to %d seconds", newInterval);
     Particle.publish("config/interval", String(newInterval), PRIVATE);
 
     return newInterval;

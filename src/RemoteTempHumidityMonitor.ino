@@ -58,6 +58,50 @@ double cloudHumidity = 0.0; // Cloud-accessible humidity value (moving average)
 int readingAge = 0; // Age of last publish in seconds
 int bufferFillPercent = 0; // Percentage of buffer filled (for monitoring)
 
+// DOE (Design of Experiments) State
+bool doeActive = false; // DOE experiment is running
+String doeStatus = "idle"; // Current DOE status
+int doeProgress = 0; // Progress percentage (0-100)
+unsigned long doeStartTime = 0; // When DOE started
+
+// DOE Configuration
+struct DOEConfig {
+    // Parameter ranges for testing (in microseconds)
+    uint16_t startSignalMin = 800;
+    uint16_t startSignalMax = 2000;
+    uint16_t startSignalStep = 100;
+
+    uint16_t responseTimeoutMin = 150;
+    uint16_t responseTimeoutMax = 300;
+    uint16_t responseTimeoutStep = 10;
+
+    uint16_t bitTimeoutMin = 80;
+    uint16_t bitTimeoutMax = 150;
+    uint16_t bitTimeoutStep = 5;
+
+    uint16_t bitThresholdMin = 40;
+    uint16_t bitThresholdMax = 60;
+    uint16_t bitThresholdStep = 2;
+
+    int testsPerConfig = 10; // Number of reads per configuration
+};
+
+DOEConfig doeConfig;
+
+// DOE Results
+struct DOEResult {
+    uint16_t startSignal;
+    uint16_t responseTimeout;
+    uint16_t bitTimeout;
+    uint16_t bitThreshold;
+    int successCount;
+    int failCount;
+    float successRate;
+};
+
+// Best result tracking
+DOEResult bestResult = {1100, 200, 100, 50, 0, 0, 0.0};
+
 // Function prototypes
 void takeMeasurement();
 void addToMovingAverage(float temperature, float humidity);
@@ -73,6 +117,15 @@ int setPublishInterval(String command);
 int forceReading(String command);
 int enableShortMsg(String command);
 
+// DOE function prototypes
+int startDOE(String command);
+int stopDOE(String command);
+void runDOEExperiment();
+DOEResult testParameterSet(uint16_t startSignal, uint16_t responseTimeout,
+                           uint16_t bitTimeout, uint16_t bitThreshold);
+void publishDOEStatus(String status);
+void publishDOEResult(DOEResult result, bool isBest);
+
 void setup() {
     // Load saved publish interval from EEPROM
     loadPublishIntervalFromEEPROM();
@@ -84,6 +137,8 @@ void setup() {
     Particle.function("setInterval", setPublishInterval);
     Particle.function("forceReading", forceReading);
     Particle.function("enableShort", enableShortMsg);
+    Particle.function("startDOE", startDOE);
+    Particle.function("stopDOE", stopDOE);
 
     // Register cloud variables
     Particle.variable("lastReading", lastReading);
@@ -93,6 +148,8 @@ void setup() {
     Particle.variable("humidity", cloudHumidity);
     Particle.variable("readingAge", readingAge);
     Particle.variable("bufferFill", bufferFillPercent);
+    Particle.variable("doeStatus", doeStatus);
+    Particle.variable("doeProgress", doeProgress);
 
     // Initialize DHT sensor
     dht.begin();
@@ -127,6 +184,13 @@ void setup() {
 }
 
 void loop() {
+    // If DOE experiment is active, run it instead of normal measurements
+    if (doeActive) {
+        runDOEExperiment();
+        // DOE will set doeActive to false when complete
+        return;
+    }
+
     // Check if it's time for a measurement (every 10 seconds)
     if (millis() - lastMeasurement >= MEASUREMENT_INTERVAL || firstRun) {
         takeMeasurement();
@@ -509,5 +573,343 @@ int enableShortMsg(String command) {
         Log.info("Short messages disabled");
         Particle.publish("config/shortmsg", "disabled", PRIVATE);
         return 0;
+    }
+}
+
+// ====================================================================
+// DOE (Design of Experiments) Functions
+// ====================================================================
+
+// Cloud function to start DOE experiment
+int startDOE(String command) {
+    if (doeActive) {
+        Log.warn("DOE already running");
+        return -1;
+    }
+
+    Log.info("Starting DOE experiment for 1-wire timing optimization");
+    doeActive = true;
+    doeStatus = "starting";
+    doeProgress = 0;
+    doeStartTime = Time.now();
+
+    // Reset best result tracking
+    bestResult.successCount = 0;
+    bestResult.failCount = 0;
+    bestResult.successRate = 0.0;
+
+    publishDOEStatus("DOE experiment started");
+
+    return 1;
+}
+
+// Cloud function to stop DOE experiment
+int stopDOE(String command) {
+    if (!doeActive) {
+        Log.warn("DOE not running");
+        return -1;
+    }
+
+    Log.info("Stopping DOE experiment");
+    doeActive = false;
+    doeStatus = "stopped";
+
+    // Restore default timing parameters
+    dht.resetTimingDefaults();
+
+    publishDOEStatus("DOE experiment stopped by user");
+
+    return 1;
+}
+
+// Main DOE experiment - runs through all parameter combinations
+void runDOEExperiment() {
+    Log.info("=== DOE Experiment Running ===");
+    doeStatus = "running";
+
+    // Calculate total number of tests
+    int startSignalSteps = (doeConfig.startSignalMax - doeConfig.startSignalMin) / doeConfig.startSignalStep + 1;
+    int responseTimeoutSteps = (doeConfig.responseTimeoutMax - doeConfig.responseTimeoutMin) / doeConfig.responseTimeoutStep + 1;
+    int bitTimeoutSteps = (doeConfig.bitTimeoutMax - doeConfig.bitTimeoutMin) / doeConfig.bitTimeoutStep + 1;
+    int bitThresholdSteps = (doeConfig.bitThresholdMax - doeConfig.bitThresholdMin) / doeConfig.bitThresholdStep + 1;
+
+    int totalTests = startSignalSteps * responseTimeoutSteps * bitTimeoutSteps * bitThresholdSteps;
+    int testsCompleted = 0;
+
+    Log.info("DOE Configuration:");
+    Log.info("  Start Signal: %d-%d us (step %d) = %d tests",
+             doeConfig.startSignalMin, doeConfig.startSignalMax, doeConfig.startSignalStep, startSignalSteps);
+    Log.info("  Response Timeout: %d-%d us (step %d) = %d tests",
+             doeConfig.responseTimeoutMin, doeConfig.responseTimeoutMax, doeConfig.responseTimeoutStep, responseTimeoutSteps);
+    Log.info("  Bit Timeout: %d-%d us (step %d) = %d tests",
+             doeConfig.bitTimeoutMin, doeConfig.bitTimeoutMax, doeConfig.bitTimeoutStep, bitTimeoutSteps);
+    Log.info("  Bit Threshold: %d-%d us (step %d) = %d tests",
+             doeConfig.bitThresholdMin, doeConfig.bitThresholdMax, doeConfig.bitThresholdStep, bitThresholdSteps);
+    Log.info("  Tests per config: %d", doeConfig.testsPerConfig);
+    Log.info("  Total configurations: %d", totalTests);
+
+    // Test each parameter independently (one-factor-at-a-time design)
+    // This is more manageable than full factorial design
+
+    // Phase 1: Test Start Signal parameter
+    doeStatus = "testing_start_signal";
+    Log.info("--- Phase 1: Testing Start Signal Parameter ---");
+    publishDOEStatus("Phase 1/4: Testing start signal timing");
+
+    uint16_t bestStartSignal = 1100; // Default
+    float bestStartSignalRate = 0.0;
+
+    for (uint16_t startSignal = doeConfig.startSignalMin;
+         startSignal <= doeConfig.startSignalMax;
+         startSignal += doeConfig.startSignalStep) {
+
+        DOEResult result = testParameterSet(startSignal, 200, 100, 50);
+
+        if (result.successRate > bestStartSignalRate) {
+            bestStartSignalRate = result.successRate;
+            bestStartSignal = result.startSignal;
+            bestResult = result;
+            publishDOEResult(result, true);
+        } else {
+            publishDOEResult(result, false);
+        }
+
+        testsCompleted++;
+        doeProgress = (testsCompleted * 100) / (startSignalSteps + responseTimeoutSteps + bitTimeoutSteps + bitThresholdSteps);
+
+        // Allow cloud communication
+        Particle.process();
+        delay(100);
+
+        // Check if stopped
+        if (!doeActive) {
+            Log.info("DOE stopped during start signal testing");
+            return;
+        }
+    }
+
+    Log.info("Best start signal: %d us (%.1f%% success)", bestStartSignal, bestStartSignalRate);
+
+    // Phase 2: Test Response Timeout parameter (using best start signal)
+    doeStatus = "testing_response_timeout";
+    Log.info("--- Phase 2: Testing Response Timeout Parameter ---");
+    publishDOEStatus("Phase 2/4: Testing response timeout");
+
+    uint16_t bestResponseTimeout = 200;
+    float bestResponseTimeoutRate = 0.0;
+
+    for (uint16_t responseTimeout = doeConfig.responseTimeoutMin;
+         responseTimeout <= doeConfig.responseTimeoutMax;
+         responseTimeout += doeConfig.responseTimeoutStep) {
+
+        DOEResult result = testParameterSet(bestStartSignal, responseTimeout, 100, 50);
+
+        if (result.successRate > bestResponseTimeoutRate) {
+            bestResponseTimeoutRate = result.successRate;
+            bestResponseTimeout = result.responseTimeout;
+            bestResult = result;
+            publishDOEResult(result, true);
+        } else {
+            publishDOEResult(result, false);
+        }
+
+        testsCompleted++;
+        doeProgress = (testsCompleted * 100) / (startSignalSteps + responseTimeoutSteps + bitTimeoutSteps + bitThresholdSteps);
+
+        Particle.process();
+        delay(100);
+
+        if (!doeActive) {
+            Log.info("DOE stopped during response timeout testing");
+            return;
+        }
+    }
+
+    Log.info("Best response timeout: %d us (%.1f%% success)", bestResponseTimeout, bestResponseTimeoutRate);
+
+    // Phase 3: Test Bit Timeout parameter
+    doeStatus = "testing_bit_timeout";
+    Log.info("--- Phase 3: Testing Bit Timeout Parameter ---");
+    publishDOEStatus("Phase 3/4: Testing bit timeout");
+
+    uint16_t bestBitTimeout = 100;
+    float bestBitTimeoutRate = 0.0;
+
+    for (uint16_t bitTimeout = doeConfig.bitTimeoutMin;
+         bitTimeout <= doeConfig.bitTimeoutMax;
+         bitTimeout += doeConfig.bitTimeoutStep) {
+
+        DOEResult result = testParameterSet(bestStartSignal, bestResponseTimeout, bitTimeout, 50);
+
+        if (result.successRate > bestBitTimeoutRate) {
+            bestBitTimeoutRate = result.successRate;
+            bestBitTimeout = result.bitTimeout;
+            bestResult = result;
+            publishDOEResult(result, true);
+        } else {
+            publishDOEResult(result, false);
+        }
+
+        testsCompleted++;
+        doeProgress = (testsCompleted * 100) / (startSignalSteps + responseTimeoutSteps + bitTimeoutSteps + bitThresholdSteps);
+
+        Particle.process();
+        delay(100);
+
+        if (!doeActive) {
+            Log.info("DOE stopped during bit timeout testing");
+            return;
+        }
+    }
+
+    Log.info("Best bit timeout: %d us (%.1f%% success)", bestBitTimeout, bestBitTimeoutRate);
+
+    // Phase 4: Test Bit Threshold parameter
+    doeStatus = "testing_bit_threshold";
+    Log.info("--- Phase 4: Testing Bit Threshold Parameter ---");
+    publishDOEStatus("Phase 4/4: Testing bit threshold");
+
+    uint16_t bestBitThreshold = 50;
+    float bestBitThresholdRate = 0.0;
+
+    for (uint16_t bitThreshold = doeConfig.bitThresholdMin;
+         bitThreshold <= doeConfig.bitThresholdMax;
+         bitThreshold += doeConfig.bitThresholdStep) {
+
+        DOEResult result = testParameterSet(bestStartSignal, bestResponseTimeout, bestBitTimeout, bitThreshold);
+
+        if (result.successRate > bestBitThresholdRate) {
+            bestBitThresholdRate = result.successRate;
+            bestBitThreshold = result.bitThreshold;
+            bestResult = result;
+            publishDOEResult(result, true);
+        } else {
+            publishDOEResult(result, false);
+        }
+
+        testsCompleted++;
+        doeProgress = (testsCompleted * 100) / (startSignalSteps + responseTimeoutSteps + bitTimeoutSteps + bitThresholdSteps);
+
+        Particle.process();
+        delay(100);
+
+        if (!doeActive) {
+            Log.info("DOE stopped during bit threshold testing");
+            return;
+        }
+    }
+
+    Log.info("Best bit threshold: %d us (%.1f%% success)", bestBitThreshold, bestBitThresholdRate);
+
+    // DOE Complete!
+    doeStatus = "complete";
+    doeProgress = 100;
+    doeActive = false;
+
+    Log.info("=== DOE Experiment Complete ===");
+    Log.info("Optimal Parameters:");
+    Log.info("  Start Signal: %d us", bestResult.startSignal);
+    Log.info("  Response Timeout: %d us", bestResult.responseTimeout);
+    Log.info("  Bit Timeout: %d us", bestResult.bitTimeout);
+    Log.info("  Bit Threshold: %d us", bestResult.bitThreshold);
+    Log.info("  Success Rate: %.1f%% (%d/%d)",
+             bestResult.successRate, bestResult.successCount,
+             bestResult.successCount + bestResult.failCount);
+
+    // Apply optimal parameters
+    dht.setStartSignal(bestResult.startSignal);
+    dht.setResponseTimeout(bestResult.responseTimeout);
+    dht.setBitTimeout(bestResult.bitTimeout);
+    dht.setBitThreshold(bestResult.bitThreshold);
+
+    // Publish final results
+    char finalMsg[256];
+    snprintf(finalMsg, sizeof(finalMsg),
+             "DOE Complete! Best: SS=%d RT=%d BT=%d BTh=%d Rate=%.1f%%",
+             bestResult.startSignal, bestResult.responseTimeout,
+             bestResult.bitTimeout, bestResult.bitThreshold,
+             bestResult.successRate);
+
+    publishDOEStatus(finalMsg);
+
+    Log.info("Optimal parameters have been applied to sensor");
+}
+
+// Test a specific parameter set
+DOEResult testParameterSet(uint16_t startSignal, uint16_t responseTimeout,
+                           uint16_t bitTimeout, uint16_t bitThreshold) {
+
+    DOEResult result;
+    result.startSignal = startSignal;
+    result.responseTimeout = responseTimeout;
+    result.bitTimeout = bitTimeout;
+    result.bitThreshold = bitThreshold;
+    result.successCount = 0;
+    result.failCount = 0;
+
+    // Configure DHT22 with test parameters
+    dht.setStartSignal(startSignal);
+    dht.setResponseTimeout(responseTimeout);
+    dht.setBitTimeout(bitTimeout);
+    dht.setBitThreshold(bitThreshold);
+
+    Log.info("Testing: SS=%d RT=%d BT=%d BTh=%d",
+             startSignal, responseTimeout, bitTimeout, bitThreshold);
+
+    // Perform multiple reads
+    for (int i = 0; i < doeConfig.testsPerConfig; i++) {
+        float temp, humidity;
+        bool success = dht.read(temp, humidity);
+
+        if (success) {
+            result.successCount++;
+        } else {
+            result.failCount++;
+        }
+
+        // Wait 2 seconds between reads (DHT22 requirement)
+        delay(2000);
+    }
+
+    result.successRate = (result.successCount * 100.0) / (result.successCount + result.failCount);
+
+    Log.info("Result: %d/%d success (%.1f%%)",
+             result.successCount, result.successCount + result.failCount,
+             result.successRate);
+
+    return result;
+}
+
+// Publish DOE status update
+void publishDOEStatus(String status) {
+    if (!Particle.connected()) {
+        return;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "{\"status\":\"%s\",\"progress\":%d,\"elapsed\":%lu}",
+             status.c_str(), doeProgress, Time.now() - doeStartTime);
+
+    Particle.publish("doe/status", msg, PRIVATE);
+    Log.info("DOE Status: %s", msg);
+}
+
+// Publish DOE result
+void publishDOEResult(DOEResult result, bool isBest) {
+    if (!Particle.connected()) {
+        return;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "{\"ss\":%d,\"rt\":%d,\"bt\":%d,\"bth\":%d,\"success\":%d,\"fail\":%d,\"rate\":%.1f,\"best\":%s}",
+             result.startSignal, result.responseTimeout, result.bitTimeout, result.bitThreshold,
+             result.successCount, result.failCount, result.successRate,
+             isBest ? "true" : "false");
+
+    Particle.publish("doe/result", msg, PRIVATE);
+
+    if (isBest) {
+        Log.info("NEW BEST: %s", msg);
     }
 }

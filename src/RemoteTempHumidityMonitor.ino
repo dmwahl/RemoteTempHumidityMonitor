@@ -61,6 +61,7 @@ double cloudTemperature = 0.0; // Cloud-accessible temperature value (moving ave
 double cloudHumidity = 0.0; // Cloud-accessible humidity value (moving average)
 int readingAge = 0; // Age of last publish in seconds
 int bufferFillPercent = 0; // Percentage of buffer filled (for monitoring)
+String resetReason = "unknown"; // Last device reset reason
 
 // DOE (Design of Experiments) State
 bool doeActive = false; // DOE experiment is running
@@ -125,6 +126,7 @@ void savePublishIntervalToEEPROM(int intervalSeconds);
 void loadTimingParametersFromEEPROM();
 void saveTimingParametersToEEPROM();
 void updateBufferSize();
+String getResetReasonString();
 int setPublishInterval(String command);
 int forceReading(String command);
 int enableShortMsg(String command);
@@ -143,6 +145,46 @@ DOEResult testParameterSet(uint16_t startSignal, uint16_t responseTimeout,
 void publishDOEStatus(String status);
 void publishDOEResult(DOEResult result, bool isBest);
 void publishPhaseSummary(String paramName, DOEResult* results, int resultCount);
+
+// Get human-readable reset reason string
+String getResetReasonString() {
+    int reason = System.resetReason();
+
+    switch(reason) {
+        case RESET_REASON_NONE:
+            return "none";
+        case RESET_REASON_UNKNOWN:
+            return "unknown";
+        case RESET_REASON_PIN_RESET:
+            return "pin_reset";
+        case RESET_REASON_POWER_MANAGEMENT:
+            return "power_management";
+        case RESET_REASON_POWER_DOWN:
+            return "power_down";
+        case RESET_REASON_POWER_BROWNOUT:
+            return "brownout";
+        case RESET_REASON_WATCHDOG:
+            return "watchdog";
+        case RESET_REASON_UPDATE:
+            return "update";
+        case RESET_REASON_UPDATE_ERROR:
+            return "update_error";
+        case RESET_REASON_UPDATE_TIMEOUT:
+            return "update_timeout";
+        case RESET_REASON_FACTORY_RESET:
+            return "factory_reset";
+        case RESET_REASON_SAFE_MODE:
+            return "safe_mode";
+        case RESET_REASON_DFU_MODE:
+            return "dfu_mode";
+        case RESET_REASON_PANIC:
+            return "panic";
+        case RESET_REASON_USER:
+            return "user";
+        default:
+            return "unknown_code_" + String(reason);
+    }
+}
 
 void setup() {
     // Load saved publish interval from EEPROM
@@ -171,12 +213,16 @@ void setup() {
     Particle.variable("humidity", cloudHumidity);
     Particle.variable("readingAge", readingAge);
     Particle.variable("bufferFill", bufferFillPercent);
+    Particle.variable("resetReason", resetReason);
     Particle.variable("doeStatus", doeStatus);
     Particle.variable("doeProgress", doeProgress);
     Particle.variable("doePhase1", doePhase1Summary);
     Particle.variable("doePhase2", doePhase2Summary);
     Particle.variable("doePhase3", doePhase3Summary);
     Particle.variable("doePhase4", doePhase4Summary);
+
+    // Read and store the last reset reason
+    resetReason = getResetReasonString();
 
     // Initialize DHT sensor
     dht.begin();

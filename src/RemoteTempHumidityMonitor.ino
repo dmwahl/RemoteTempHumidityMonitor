@@ -157,7 +157,7 @@ void setup() {
     // Wait for sensor to stabilize
     delay(2000);
 
-    Log.info("Remote Temp/Humidity Monitor v1.2.0");
+    Log.info("Remote Temp/Humidity Monitor v1.3.0");
     Log.info("Measurement interval: 10 seconds (fixed)");
     Log.info("Publish interval: %d seconds", currentPublishInterval);
     Log.info("Moving average buffer size: %d readings", bufferSize);

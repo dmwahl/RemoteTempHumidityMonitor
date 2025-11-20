@@ -1200,6 +1200,46 @@ void publishPhaseSummary(String paramName, DOEResult* results, int resultCount) 
     }
     float stdDev = sqrt(sumSquaredDiff / resultCount);
 
+    // Calculate coefficient of variation (CV)
+    // CV = (stdDev / mean) * 100%
+    // Measures relative variability; lower CV = more consistent results
+    float cv = (avgFailRate > 0.001) ? (stdDev / avgFailRate) * 100.0 : 0.0;
+
+    // Calculate statistical significance (p-value approximation)
+    // Using z-score: z = (best - mean) / (stdDev / sqrt(n))
+    // This tests if the best result is significantly different from the mean
+    float zScore = 0.0;
+    float pValue = 1.0;
+
+    if (stdDev > 0.001 && resultCount > 1) {
+        // Standard error of the mean
+        float sem = stdDev / sqrt(resultCount);
+
+        // Z-score for best result vs. average
+        zScore = (avgFailRate - minFailRate) / sem;
+
+        // Convert z-score to approximate p-value using error function approximation
+        // This is a simplified one-tailed test
+        // For z > 0, p-value approximation using normal distribution
+        if (zScore > 0) {
+            // Simplified p-value approximation (good for z > 0)
+            // Using: p ≈ 0.5 * erfc(z / sqrt(2))
+            // Approximation: erfc(x) ≈ exp(-x²) / (x * sqrt(π))
+            float x = zScore / sqrt(2.0);
+            if (x > 0.1) {
+                // More accurate for larger z
+                pValue = 0.5 * exp(-x * x) / (x * sqrt(M_PI));
+            } else {
+                // For small z, use direct approximation
+                pValue = 0.5 * (1.0 - 0.5 * zScore * sqrt(2.0 / M_PI));
+            }
+
+            // Clamp p-value to valid range
+            if (pValue < 0.0001) pValue = 0.0001;
+            if (pValue > 1.0) pValue = 1.0;
+        }
+    }
+
     // Build CSV-style data for spreadsheet export
     // Format: value,success,fail,success_rate,fail_rate (one line per test)
     String csvData = "";
@@ -1229,14 +1269,19 @@ void publishPhaseSummary(String paramName, DOEResult* results, int resultCount) 
     }
 
     // Publish summary statistics
-    char summaryMsg[512];
+    char summaryMsg[622];
     snprintf(summaryMsg, sizeof(summaryMsg),
-             "{\"param\":\"%s\",\"count\":%d,\"avg_fail\":%.2f,\"best_fail\":%.2f,\"worst_fail\":%.2f,\"std_dev\":%.2f,\"best_value\":%d}",
-             paramName.c_str(), resultCount, avgFailRate, minFailRate, maxFailRate, stdDev, bestValue);
+             "{\"param\":\"%s\",\"count\":%d,\"avg_fail\":%.2f,\"best_fail\":%.2f,\"worst_fail\":%.2f,"
+             "\"std_dev\":%.2f,\"cv\":%.2f,\"z_score\":%.2f,\"p_value\":%.4f,\"best_value\":%d}",
+             paramName.c_str(), resultCount, avgFailRate, minFailRate, maxFailRate,
+             stdDev, cv, zScore, pValue, bestValue);
 
     Particle.publish("doe/phase_summary", summaryMsg, PRIVATE);
-    Log.info("Phase Summary [%s]: Avg=%.2f%% Best=%.2f%% StdDev=%.2f%% BestValue=%d",
-             paramName.c_str(), avgFailRate, minFailRate, stdDev, bestValue);
+
+    Log.info("Phase Summary [%s]:", paramName.c_str());
+    Log.info("  Avg Fail: %.2f%%  Best: %.2f%%  Worst: %.2f%%", avgFailRate, minFailRate, maxFailRate);
+    Log.info("  StdDev: %.2f%%  CV: %.2f%%", stdDev, cv);
+    Log.info("  Z-Score: %.2f  P-Value: %.4f  Best Value: %d", zScore, pValue, bestValue);
 
     // Publish detailed CSV data (may be split into multiple events if needed)
     // Due to Particle event size limits (622 bytes for data), we publish in chunks

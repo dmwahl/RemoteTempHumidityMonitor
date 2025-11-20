@@ -16,8 +16,12 @@
 #define DHTPIN D3
 
 // EEPROM Configuration
-#define EEPROM_PUBLISH_INTERVAL_ADDR 0  // Address to store publish interval
-#define EEPROM_MAGIC_ADDR 4             // Address to store magic number (validation)
+#define EEPROM_PUBLISH_INTERVAL_ADDR 0  // Address to store publish interval (4 bytes)
+#define EEPROM_MAGIC_ADDR 4             // Address to store magic number (4 bytes)
+#define EEPROM_START_SIGNAL_ADDR 8      // Address to store start signal timing (2 bytes)
+#define EEPROM_RESPONSE_TIMEOUT_ADDR 10 // Address to store response timeout (2 bytes)
+#define EEPROM_BIT_TIMEOUT_ADDR 12      // Address to store bit timeout (2 bytes)
+#define EEPROM_BIT_THRESHOLD_ADDR 14    // Address to store bit threshold (2 bytes)
 #define EEPROM_MAGIC 0xA5B4C3D2         // Magic number to validate EEPROM data
 
 // System mode - Use AUTOMATIC for reliable cloud connection
@@ -112,10 +116,16 @@ String createJsonPayload(float temperature, float humidity);
 String createShortPayload(float temperature, float humidity);
 void loadPublishIntervalFromEEPROM();
 void savePublishIntervalToEEPROM(int intervalSeconds);
+void loadTimingParametersFromEEPROM();
+void saveTimingParametersToEEPROM();
 void updateBufferSize();
 int setPublishInterval(String command);
 int forceReading(String command);
 int enableShortMsg(String command);
+int setStartSignalTiming(String command);
+int setResponseTimeoutTiming(String command);
+int setBitTimeoutTiming(String command);
+int setBitThresholdTiming(String command);
 
 // DOE function prototypes
 int startDOE(String command);
@@ -139,6 +149,10 @@ void setup() {
     Particle.function("enableShort", enableShortMsg);
     Particle.function("startDOE", startDOE);
     Particle.function("stopDOE", stopDOE);
+    Particle.function("setStartSig", setStartSignalTiming);
+    Particle.function("setRespTO", setResponseTimeoutTiming);
+    Particle.function("setBitTO", setBitTimeoutTiming);
+    Particle.function("setBitThr", setBitThresholdTiming);
 
     // Register cloud variables
     Particle.variable("lastReading", lastReading);
@@ -153,6 +167,9 @@ void setup() {
 
     // Initialize DHT sensor
     dht.begin();
+
+    // Load saved timing parameters from EEPROM
+    loadTimingParametersFromEEPROM();
 
     // Wait for sensor to stabilize
     delay(2000);
@@ -577,6 +594,176 @@ int enableShortMsg(String command) {
 }
 
 // ====================================================================
+// Timing Parameter Configuration Functions
+// ====================================================================
+
+// Load timing parameters from EEPROM
+void loadTimingParametersFromEEPROM() {
+    uint32_t magic;
+    uint16_t startSignal, responseTimeout, bitTimeout, bitThreshold;
+
+    // Check if EEPROM has valid data by reading magic number
+    EEPROM.get(EEPROM_MAGIC_ADDR, magic);
+
+    if (magic == EEPROM_MAGIC) {
+        // Valid data exists, load the timing parameters
+        EEPROM.get(EEPROM_START_SIGNAL_ADDR, startSignal);
+        EEPROM.get(EEPROM_RESPONSE_TIMEOUT_ADDR, responseTimeout);
+        EEPROM.get(EEPROM_BIT_TIMEOUT_ADDR, bitTimeout);
+        EEPROM.get(EEPROM_BIT_THRESHOLD_ADDR, bitThreshold);
+
+        // Validate loaded values against DOE limits
+        bool valid = true;
+        if (startSignal < doeConfig.startSignalMin || startSignal > doeConfig.startSignalMax) {
+            Log.warn("EEPROM start signal %d out of range, using default", startSignal);
+            valid = false;
+        }
+        if (responseTimeout < doeConfig.responseTimeoutMin || responseTimeout > doeConfig.responseTimeoutMax) {
+            Log.warn("EEPROM response timeout %d out of range, using default", responseTimeout);
+            valid = false;
+        }
+        if (bitTimeout < doeConfig.bitTimeoutMin || bitTimeout > doeConfig.bitTimeoutMax) {
+            Log.warn("EEPROM bit timeout %d out of range, using default", bitTimeout);
+            valid = false;
+        }
+        if (bitThreshold < doeConfig.bitThresholdMin || bitThreshold > doeConfig.bitThresholdMax) {
+            Log.warn("EEPROM bit threshold %d out of range, using default", bitThreshold);
+            valid = false;
+        }
+
+        if (valid) {
+            // Apply loaded parameters to DHT22
+            dht.setStartSignal(startSignal);
+            dht.setResponseTimeout(responseTimeout);
+            dht.setBitTimeout(bitTimeout);
+            dht.setBitThreshold(bitThreshold);
+
+            Log.info("Loaded timing parameters from EEPROM:");
+            Log.info("  Start Signal: %d us", startSignal);
+            Log.info("  Response Timeout: %d us", responseTimeout);
+            Log.info("  Bit Timeout: %d us", bitTimeout);
+            Log.info("  Bit Threshold: %d us", bitThreshold);
+        } else {
+            Log.info("Using default timing parameters");
+        }
+    } else {
+        Log.info("No valid timing parameters in EEPROM, using defaults");
+    }
+}
+
+// Save current timing parameters to EEPROM
+void saveTimingParametersToEEPROM() {
+    uint16_t startSignal = dht.getStartSignal();
+    uint16_t responseTimeout = dht.getResponseTimeout();
+    uint16_t bitTimeout = dht.getBitTimeout();
+    uint16_t bitThreshold = dht.getBitThreshold();
+
+    // Save parameters
+    EEPROM.put(EEPROM_START_SIGNAL_ADDR, startSignal);
+    EEPROM.put(EEPROM_RESPONSE_TIMEOUT_ADDR, responseTimeout);
+    EEPROM.put(EEPROM_BIT_TIMEOUT_ADDR, bitTimeout);
+    EEPROM.put(EEPROM_BIT_THRESHOLD_ADDR, bitThreshold);
+
+    Log.info("Saved timing parameters to EEPROM:");
+    Log.info("  Start Signal: %d us", startSignal);
+    Log.info("  Response Timeout: %d us", responseTimeout);
+    Log.info("  Bit Timeout: %d us", bitTimeout);
+    Log.info("  Bit Threshold: %d us", bitThreshold);
+}
+
+// Cloud function to set start signal timing
+int setStartSignalTiming(String command) {
+    int value = command.toInt();
+
+    // Validate against DOE limits
+    if (value < doeConfig.startSignalMin || value > doeConfig.startSignalMax) {
+        Log.error("Start signal %d out of range (%d-%d us)",
+                  value, doeConfig.startSignalMin, doeConfig.startSignalMax);
+        return -1;
+    }
+
+    // Apply new value
+    dht.setStartSignal((uint16_t)value);
+
+    // Save to EEPROM
+    saveTimingParametersToEEPROM();
+
+    Log.info("Start signal timing updated to %d us", value);
+    Particle.publish("config/timing", String::format("start_signal=%d", value), PRIVATE);
+
+    return value;
+}
+
+// Cloud function to set response timeout timing
+int setResponseTimeoutTiming(String command) {
+    int value = command.toInt();
+
+    // Validate against DOE limits
+    if (value < doeConfig.responseTimeoutMin || value > doeConfig.responseTimeoutMax) {
+        Log.error("Response timeout %d out of range (%d-%d us)",
+                  value, doeConfig.responseTimeoutMin, doeConfig.responseTimeoutMax);
+        return -1;
+    }
+
+    // Apply new value
+    dht.setResponseTimeout((uint16_t)value);
+
+    // Save to EEPROM
+    saveTimingParametersToEEPROM();
+
+    Log.info("Response timeout updated to %d us", value);
+    Particle.publish("config/timing", String::format("response_timeout=%d", value), PRIVATE);
+
+    return value;
+}
+
+// Cloud function to set bit timeout timing
+int setBitTimeoutTiming(String command) {
+    int value = command.toInt();
+
+    // Validate against DOE limits
+    if (value < doeConfig.bitTimeoutMin || value > doeConfig.bitTimeoutMax) {
+        Log.error("Bit timeout %d out of range (%d-%d us)",
+                  value, doeConfig.bitTimeoutMin, doeConfig.bitTimeoutMax);
+        return -1;
+    }
+
+    // Apply new value
+    dht.setBitTimeout((uint16_t)value);
+
+    // Save to EEPROM
+    saveTimingParametersToEEPROM();
+
+    Log.info("Bit timeout updated to %d us", value);
+    Particle.publish("config/timing", String::format("bit_timeout=%d", value), PRIVATE);
+
+    return value;
+}
+
+// Cloud function to set bit threshold timing
+int setBitThresholdTiming(String command) {
+    int value = command.toInt();
+
+    // Validate against DOE limits
+    if (value < doeConfig.bitThresholdMin || value > doeConfig.bitThresholdMax) {
+        Log.error("Bit threshold %d out of range (%d-%d us)",
+                  value, doeConfig.bitThresholdMin, doeConfig.bitThresholdMax);
+        return -1;
+    }
+
+    // Apply new value
+    dht.setBitThreshold((uint16_t)value);
+
+    // Save to EEPROM
+    saveTimingParametersToEEPROM();
+
+    Log.info("Bit threshold updated to %d us", value);
+    Particle.publish("config/timing", String::format("bit_threshold=%d", value), PRIVATE);
+
+    return value;
+}
+
+// ====================================================================
 // DOE (Design of Experiments) Functions
 // ====================================================================
 
@@ -822,6 +1009,9 @@ void runDOEExperiment() {
     dht.setBitTimeout(bestResult.bitTimeout);
     dht.setBitThreshold(bestResult.bitThreshold);
 
+    // Save optimal parameters to EEPROM for persistence
+    saveTimingParametersToEEPROM();
+
     // Publish final results
     char finalMsg[256];
     snprintf(finalMsg, sizeof(finalMsg),
@@ -832,7 +1022,7 @@ void runDOEExperiment() {
 
     publishDOEStatus(finalMsg);
 
-    Log.info("Optimal parameters have been applied to sensor");
+    Log.info("Optimal parameters have been applied and saved to EEPROM");
 }
 
 // Test a specific parameter set

@@ -132,6 +132,7 @@ int setStartSignalTiming(String command);
 int setResponseTimeoutTiming(String command);
 int setBitTimeoutTiming(String command);
 int setBitThresholdTiming(String command);
+int publishUptime(String command);
 
 // DOE function prototypes
 int startDOE(String command);
@@ -160,6 +161,7 @@ void setup() {
     Particle.function("setRespTO", setResponseTimeoutTiming);
     Particle.function("setBitTO", setBitTimeoutTiming);
     Particle.function("setBitThr", setBitThresholdTiming);
+    Particle.function("uptime", publishUptime);
 
     // Register cloud variables
     Particle.variable("lastReading", lastReading);
@@ -602,6 +604,56 @@ int enableShortMsg(String command) {
         Particle.publish("config/shortmsg", "disabled", PRIVATE);
         return 0;
     }
+}
+
+// Cloud function to publish system uptime
+int publishUptime(String command) {
+    // Get system uptime in seconds
+    system_tick_t uptimeSeconds = System.uptime();
+
+    // Calculate days, hours, minutes
+    uint32_t days = uptimeSeconds / 86400;
+    uint32_t hours = (uptimeSeconds % 86400) / 3600;
+    uint32_t minutes = (uptimeSeconds % 3600) / 60;
+    uint32_t seconds = uptimeSeconds % 60;
+
+    // Get current time
+    String currentTime = Time.format(Time.now(), "%H:%M:%S");
+
+    // Get free memory
+    uint32_t freeMem = System.freeMemory();
+
+    // Get cloud connection status
+    String cloudStatus = Particle.connected() ? "connected" : "disconnected";
+
+    // Format uptime string similar to Linux uptime command
+    // Example: "10:15:23 up 5 days, 3:42, cloud: connected, free mem: 45632 bytes"
+    char uptimeMsg[256];
+
+    if (days > 0) {
+        snprintf(uptimeMsg, sizeof(uptimeMsg),
+                 "%s up %lu day%s, %lu:%02lu, cloud: %s, free mem: %lu bytes",
+                 currentTime.c_str(), days, (days == 1 ? "" : "s"),
+                 hours, minutes, cloudStatus.c_str(), freeMem);
+    } else if (hours > 0) {
+        snprintf(uptimeMsg, sizeof(uptimeMsg),
+                 "%s up %lu:%02lu, cloud: %s, free mem: %lu bytes",
+                 currentTime.c_str(), hours, minutes, cloudStatus.c_str(), freeMem);
+    } else {
+        snprintf(uptimeMsg, sizeof(uptimeMsg),
+                 "%s up %lu min, cloud: %s, free mem: %lu bytes",
+                 currentTime.c_str(), minutes, cloudStatus.c_str(), freeMem);
+    }
+
+    // Publish to cloud
+    if (Particle.connected()) {
+        Particle.publish("system/uptime", uptimeMsg, PRIVATE);
+    }
+
+    // Log locally
+    Log.info("Uptime: %s", uptimeMsg);
+
+    return 1;
 }
 
 // ====================================================================

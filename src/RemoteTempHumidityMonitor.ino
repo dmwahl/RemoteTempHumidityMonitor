@@ -110,8 +110,8 @@ struct DOEResult {
     float successRate;
 };
 
-// Best result tracking (initialized with DOE-optimized defaults)
-DOEResult bestResult = {1600, 240, 115, 46, 0, 0, 0.0};
+// Best result tracking (initialized with default timing parameters)
+DOEResult bestResult = {1100, 200, 100, 50, 0, 0, 0.0};
 
 // Function prototypes
 void takeMeasurement();
@@ -523,17 +523,17 @@ bool shouldPublish(float avgTemp, float avgHumidity) {
     // Calculate time since last publish
     unsigned long timeSincePublish = Time.now() - lastPublishTime;
 
-    // Check if 5x publish interval has elapsed (force publish)
-    if (timeSincePublish >= (publishInterval * 5)) {
-        Log.info("Publishing: 5x interval elapsed (%lu >= %lu seconds)",
-                 timeSincePublish, publishInterval * 5);
+    // Check if 60 minutes has elapsed (force publish)
+    if (timeSincePublish >= 3600) {
+        Log.info("Publishing: 60 minutes elapsed (%lu >= 3600 seconds)",
+                 timeSincePublish);
         return true;
     }
 
-    // Check if temperature changed by >= 0.25°C
+    // Check if temperature changed by >= 0.5°C
     float tempChange = abs(avgTemp - lastPublishedTemp);
-    if (tempChange >= 0.25) {
-        Log.info("Publishing: temp changed %.2f°C (>= 0.25°C)", tempChange);
+    if (tempChange >= 0.5) {
+        Log.info("Publishing: temp changed %.2f°C (>= 0.5°C)", tempChange);
         return true;
     }
 
@@ -958,7 +958,7 @@ void runDOEExperiment() {
     Log.info("--- Phase 1: Testing Start Signal Parameter ---");
     publishDOEStatus("Phase 1/4: Testing start signal timing");
 
-    uint16_t bestStartSignal = 1600; // DOE-optimized default
+    uint16_t bestStartSignal = 1100; // Default value
     float bestStartSignalRate = 0.0;
 
     // Collect all results for this phase
@@ -969,7 +969,7 @@ void runDOEExperiment() {
          startSignal <= doeConfig.startSignalMax;
          startSignal += doeConfig.startSignalStep) {
 
-        DOEResult result = testParameterSet(startSignal, 240, 115, 46);
+        DOEResult result = testParameterSet(startSignal, 200, 100, 50);
 
         // Store result for summary
         if (startSignalResultCount < 20) {
@@ -1009,7 +1009,7 @@ void runDOEExperiment() {
     Log.info("--- Phase 2: Testing Response Timeout Parameter ---");
     publishDOEStatus("Phase 2/4: Testing response timeout");
 
-    uint16_t bestResponseTimeout = 240;
+    uint16_t bestResponseTimeout = 200;
     float bestResponseTimeoutRate = 0.0;
 
     // Collect all results for this phase
@@ -1020,7 +1020,7 @@ void runDOEExperiment() {
          responseTimeout <= doeConfig.responseTimeoutMax;
          responseTimeout += doeConfig.responseTimeoutStep) {
 
-        DOEResult result = testParameterSet(bestStartSignal, responseTimeout, 115, 46);
+        DOEResult result = testParameterSet(bestStartSignal, responseTimeout, 100, 50);
 
         // Store result for summary
         if (responseTimeoutResultCount < 20) {
@@ -1058,7 +1058,7 @@ void runDOEExperiment() {
     Log.info("--- Phase 3: Testing Bit Timeout Parameter ---");
     publishDOEStatus("Phase 3/4: Testing bit timeout");
 
-    uint16_t bestBitTimeout = 115;
+    uint16_t bestBitTimeout = 100;
     float bestBitTimeoutRate = 0.0;
 
     // Collect all results for this phase
@@ -1069,7 +1069,7 @@ void runDOEExperiment() {
          bitTimeout <= doeConfig.bitTimeoutMax;
          bitTimeout += doeConfig.bitTimeoutStep) {
 
-        DOEResult result = testParameterSet(bestStartSignal, bestResponseTimeout, bitTimeout, 46);
+        DOEResult result = testParameterSet(bestStartSignal, bestResponseTimeout, bitTimeout, 50);
 
         // Store result for summary
         if (bitTimeoutResultCount < 20) {
@@ -1107,7 +1107,7 @@ void runDOEExperiment() {
     Log.info("--- Phase 4: Testing Bit Threshold Parameter ---");
     publishDOEStatus("Phase 4/4: Testing bit threshold");
 
-    uint16_t bestBitThreshold = 46;
+    uint16_t bestBitThreshold = 50;
     float bestBitThresholdRate = 0.0;
 
     // Collect all results for this phase

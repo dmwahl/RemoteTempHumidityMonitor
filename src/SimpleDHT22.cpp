@@ -11,10 +11,10 @@ SimpleDHT22::SimpleDHT22(pin_t pin) : _pin(pin), _lastTemperature(0), _lastHumid
 }
 
 void SimpleDHT22::resetTimingDefaults() {
-    _startSignal = 1600;      // 1.6ms start signal (optimized via DOE)
-    _responseTimeout = 240;   // 240us timeout for sensor response (optimized via DOE)
-    _bitTimeout = 115;        // 115us timeout for bit signals (optimized via DOE)
-    _bitThreshold = 46;       // 46us threshold for bit decision (optimized via DOE)
+    _startSignal = 1100;      // 1.1ms start signal (per DHT22 datasheet: 1-10ms)
+    _responseTimeout = 200;   // 200us timeout for sensor response (conservative)
+    _bitTimeout = 100;        // 100us timeout for bit signals (conservative)
+    _bitThreshold = 50;       // 50us threshold for bit decision (per DHT22 datasheet)
 }
 
 void SimpleDHT22::begin() {

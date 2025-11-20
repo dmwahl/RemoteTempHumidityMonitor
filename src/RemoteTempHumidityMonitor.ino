@@ -83,7 +83,7 @@ struct DOEConfig {
     uint16_t bitThresholdMax = 60;
     uint16_t bitThresholdStep = 2;
 
-    int testsPerConfig = 10; // Number of reads per configuration
+    int testsPerConfig = 30; // Number of reads per configuration
 };
 
 DOEConfig doeConfig;

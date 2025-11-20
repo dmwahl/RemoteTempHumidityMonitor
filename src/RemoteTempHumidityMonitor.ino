@@ -135,6 +135,7 @@ DOEResult testParameterSet(uint16_t startSignal, uint16_t responseTimeout,
                            uint16_t bitTimeout, uint16_t bitThreshold);
 void publishDOEStatus(String status);
 void publishDOEResult(DOEResult result, bool isBest);
+void publishPhaseSummary(String paramName, DOEResult* results, int resultCount);
 
 void setup() {
     // Load saved publish interval from EEPROM
@@ -846,11 +847,20 @@ void runDOEExperiment() {
     uint16_t bestStartSignal = 1100; // Default
     float bestStartSignalRate = 0.0;
 
+    // Collect all results for this phase
+    DOEResult startSignalResults[20]; // Max 20 results (generous for 800-2000 step 100)
+    int startSignalResultCount = 0;
+
     for (uint16_t startSignal = doeConfig.startSignalMin;
          startSignal <= doeConfig.startSignalMax;
          startSignal += doeConfig.startSignalStep) {
 
         DOEResult result = testParameterSet(startSignal, 200, 100, 50);
+
+        // Store result for summary
+        if (startSignalResultCount < 20) {
+            startSignalResults[startSignalResultCount++] = result;
+        }
 
         if (result.successRate > bestStartSignalRate) {
             bestStartSignalRate = result.successRate;
@@ -877,6 +887,9 @@ void runDOEExperiment() {
 
     Log.info("Best start signal: %d us (%.1f%% success)", bestStartSignal, bestStartSignalRate);
 
+    // Publish phase 1 summary statistics
+    publishPhaseSummary("start_signal", startSignalResults, startSignalResultCount);
+
     // Phase 2: Test Response Timeout parameter (using best start signal)
     doeStatus = "testing_response_timeout";
     Log.info("--- Phase 2: Testing Response Timeout Parameter ---");
@@ -885,11 +898,20 @@ void runDOEExperiment() {
     uint16_t bestResponseTimeout = 200;
     float bestResponseTimeoutRate = 0.0;
 
+    // Collect all results for this phase
+    DOEResult responseTimeoutResults[20]; // Max 20 results
+    int responseTimeoutResultCount = 0;
+
     for (uint16_t responseTimeout = doeConfig.responseTimeoutMin;
          responseTimeout <= doeConfig.responseTimeoutMax;
          responseTimeout += doeConfig.responseTimeoutStep) {
 
         DOEResult result = testParameterSet(bestStartSignal, responseTimeout, 100, 50);
+
+        // Store result for summary
+        if (responseTimeoutResultCount < 20) {
+            responseTimeoutResults[responseTimeoutResultCount++] = result;
+        }
 
         if (result.successRate > bestResponseTimeoutRate) {
             bestResponseTimeoutRate = result.successRate;
@@ -914,6 +936,9 @@ void runDOEExperiment() {
 
     Log.info("Best response timeout: %d us (%.1f%% success)", bestResponseTimeout, bestResponseTimeoutRate);
 
+    // Publish phase 2 summary statistics
+    publishPhaseSummary("response_timeout", responseTimeoutResults, responseTimeoutResultCount);
+
     // Phase 3: Test Bit Timeout parameter
     doeStatus = "testing_bit_timeout";
     Log.info("--- Phase 3: Testing Bit Timeout Parameter ---");
@@ -922,11 +947,20 @@ void runDOEExperiment() {
     uint16_t bestBitTimeout = 100;
     float bestBitTimeoutRate = 0.0;
 
+    // Collect all results for this phase
+    DOEResult bitTimeoutResults[20]; // Max 20 results
+    int bitTimeoutResultCount = 0;
+
     for (uint16_t bitTimeout = doeConfig.bitTimeoutMin;
          bitTimeout <= doeConfig.bitTimeoutMax;
          bitTimeout += doeConfig.bitTimeoutStep) {
 
         DOEResult result = testParameterSet(bestStartSignal, bestResponseTimeout, bitTimeout, 50);
+
+        // Store result for summary
+        if (bitTimeoutResultCount < 20) {
+            bitTimeoutResults[bitTimeoutResultCount++] = result;
+        }
 
         if (result.successRate > bestBitTimeoutRate) {
             bestBitTimeoutRate = result.successRate;
@@ -951,6 +985,9 @@ void runDOEExperiment() {
 
     Log.info("Best bit timeout: %d us (%.1f%% success)", bestBitTimeout, bestBitTimeoutRate);
 
+    // Publish phase 3 summary statistics
+    publishPhaseSummary("bit_timeout", bitTimeoutResults, bitTimeoutResultCount);
+
     // Phase 4: Test Bit Threshold parameter
     doeStatus = "testing_bit_threshold";
     Log.info("--- Phase 4: Testing Bit Threshold Parameter ---");
@@ -959,11 +996,20 @@ void runDOEExperiment() {
     uint16_t bestBitThreshold = 50;
     float bestBitThresholdRate = 0.0;
 
+    // Collect all results for this phase
+    DOEResult bitThresholdResults[20]; // Max 20 results
+    int bitThresholdResultCount = 0;
+
     for (uint16_t bitThreshold = doeConfig.bitThresholdMin;
          bitThreshold <= doeConfig.bitThresholdMax;
          bitThreshold += doeConfig.bitThresholdStep) {
 
         DOEResult result = testParameterSet(bestStartSignal, bestResponseTimeout, bestBitTimeout, bitThreshold);
+
+        // Store result for summary
+        if (bitThresholdResultCount < 20) {
+            bitThresholdResults[bitThresholdResultCount++] = result;
+        }
 
         if (result.successRate > bestBitThresholdRate) {
             bestBitThresholdRate = result.successRate;
@@ -987,6 +1033,9 @@ void runDOEExperiment() {
     }
 
     Log.info("Best bit threshold: %d us (%.1f%% success)", bestBitThreshold, bestBitThresholdRate);
+
+    // Publish phase 4 summary statistics
+    publishPhaseSummary("bit_threshold", bitThresholdResults, bitThresholdResultCount);
 
     // DOE Complete!
     doeStatus = "complete";
@@ -1101,5 +1150,114 @@ void publishDOEResult(DOEResult result, bool isBest) {
 
     if (isBest) {
         Log.info("NEW BEST: %s", msg);
+    }
+}
+
+// Publish phase summary with statistics (for spreadsheet export)
+void publishPhaseSummary(String paramName, DOEResult* results, int resultCount) {
+    if (!Particle.connected() || resultCount == 0) {
+        return;
+    }
+
+    // Calculate statistics
+    float sumFailRate = 0.0;
+    float minFailRate = 100.0;
+    float maxFailRate = 0.0;
+    uint16_t bestValue = 0;
+
+    // First pass: sum and find min/max
+    for (int i = 0; i < resultCount; i++) {
+        float failRate = 100.0 - results[i].successRate;
+        sumFailRate += failRate;
+
+        if (failRate < minFailRate) {
+            minFailRate = failRate;
+            // Determine which parameter value this result represents
+            if (paramName == "start_signal") {
+                bestValue = results[i].startSignal;
+            } else if (paramName == "response_timeout") {
+                bestValue = results[i].responseTimeout;
+            } else if (paramName == "bit_timeout") {
+                bestValue = results[i].bitTimeout;
+            } else if (paramName == "bit_threshold") {
+                bestValue = results[i].bitThreshold;
+            }
+        }
+
+        if (failRate > maxFailRate) {
+            maxFailRate = failRate;
+        }
+    }
+
+    float avgFailRate = sumFailRate / resultCount;
+
+    // Second pass: calculate standard deviation
+    float sumSquaredDiff = 0.0;
+    for (int i = 0; i < resultCount; i++) {
+        float failRate = 100.0 - results[i].successRate;
+        float diff = failRate - avgFailRate;
+        sumSquaredDiff += diff * diff;
+    }
+    float stdDev = sqrt(sumSquaredDiff / resultCount);
+
+    // Build CSV-style data for spreadsheet export
+    // Format: value,success,fail,success_rate,fail_rate (one line per test)
+    String csvData = "";
+
+    for (int i = 0; i < resultCount; i++) {
+        uint16_t value;
+        if (paramName == "start_signal") {
+            value = results[i].startSignal;
+        } else if (paramName == "response_timeout") {
+            value = results[i].responseTimeout;
+        } else if (paramName == "bit_timeout") {
+            value = results[i].bitTimeout;
+        } else {
+            value = results[i].bitThreshold;
+        }
+
+        float failRate = 100.0 - results[i].successRate;
+
+        char line[80];
+        snprintf(line, sizeof(line), "%d,%d,%d,%.1f,%.1f\\n",
+                 value, results[i].successCount, results[i].failCount,
+                 results[i].successRate, failRate);
+        csvData += line;
+
+        // Particle publish has size limits, so we'll publish in chunks if needed
+        // or just send summary statistics in a separate message
+    }
+
+    // Publish summary statistics
+    char summaryMsg[512];
+    snprintf(summaryMsg, sizeof(summaryMsg),
+             "{\"param\":\"%s\",\"count\":%d,\"avg_fail\":%.2f,\"best_fail\":%.2f,\"worst_fail\":%.2f,\"std_dev\":%.2f,\"best_value\":%d}",
+             paramName.c_str(), resultCount, avgFailRate, minFailRate, maxFailRate, stdDev, bestValue);
+
+    Particle.publish("doe/phase_summary", summaryMsg, PRIVATE);
+    Log.info("Phase Summary [%s]: Avg=%.2f%% Best=%.2f%% StdDev=%.2f%% BestValue=%d",
+             paramName.c_str(), avgFailRate, minFailRate, stdDev, bestValue);
+
+    // Publish detailed CSV data (may be split into multiple events if needed)
+    // Due to Particle event size limits (622 bytes for data), we publish in chunks
+    const int MAX_CSV_SIZE = 600;
+    int csvLength = csvData.length();
+    int chunks = (csvLength + MAX_CSV_SIZE - 1) / MAX_CSV_SIZE;
+
+    for (int chunk = 0; chunk < chunks; chunk++) {
+        int start = chunk * MAX_CSV_SIZE;
+        int end = min(start + MAX_CSV_SIZE, csvLength);
+        String csvChunk = csvData.substring(start, end);
+
+        char csvMsg[650];
+        snprintf(csvMsg, sizeof(csvMsg), "{\"param\":\"%s\",\"chunk\":%d,\"total\":%d,\"data\":\"%s\"}",
+                 paramName.c_str(), chunk + 1, chunks, csvChunk.c_str());
+
+        Particle.publish("doe/phase_data", csvMsg, PRIVATE);
+
+        // Small delay between chunks to avoid rate limiting
+        if (chunk < chunks - 1) {
+            delay(1000);
+        }
     }
 }

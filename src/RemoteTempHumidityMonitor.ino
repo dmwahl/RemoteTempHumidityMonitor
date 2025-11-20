@@ -16,8 +16,12 @@
 #define DHTPIN D3
 
 // EEPROM Configuration
-#define EEPROM_PUBLISH_INTERVAL_ADDR 0  // Address to store publish interval
-#define EEPROM_MAGIC_ADDR 4             // Address to store magic number (validation)
+#define EEPROM_PUBLISH_INTERVAL_ADDR 0  // Address to store publish interval (4 bytes)
+#define EEPROM_MAGIC_ADDR 4             // Address to store magic number (4 bytes)
+#define EEPROM_START_SIGNAL_ADDR 8      // Address to store start signal timing (2 bytes)
+#define EEPROM_RESPONSE_TIMEOUT_ADDR 10 // Address to store response timeout (2 bytes)
+#define EEPROM_BIT_TIMEOUT_ADDR 12      // Address to store bit timeout (2 bytes)
+#define EEPROM_BIT_THRESHOLD_ADDR 14    // Address to store bit threshold (2 bytes)
 #define EEPROM_MAGIC 0xA5B4C3D2         // Magic number to validate EEPROM data
 
 // System mode - Use AUTOMATIC for reliable cloud connection
@@ -57,6 +61,57 @@ double cloudTemperature = 0.0; // Cloud-accessible temperature value (moving ave
 double cloudHumidity = 0.0; // Cloud-accessible humidity value (moving average)
 int readingAge = 0; // Age of last publish in seconds
 int bufferFillPercent = 0; // Percentage of buffer filled (for monitoring)
+String resetReason = "unknown"; // Last device reset reason
+
+// DOE (Design of Experiments) State
+bool doeActive = false; // DOE experiment is running
+String doeStatus = "idle"; // Current DOE status
+int doeProgress = 0; // Progress percentage (0-100)
+unsigned long doeStartTime = 0; // When DOE started
+
+// DOE Phase Results (stored as cloud-accessible JSON strings)
+String doePhase1Summary = "{}"; // Start signal phase summary
+String doePhase2Summary = "{}"; // Response timeout phase summary
+String doePhase3Summary = "{}"; // Bit timeout phase summary
+String doePhase4Summary = "{}"; // Bit threshold phase summary
+
+// DOE Configuration
+struct DOEConfig {
+    // Parameter ranges for testing (in microseconds)
+    uint16_t startSignalMin = 800;
+    uint16_t startSignalMax = 2000;
+    uint16_t startSignalStep = 100;
+
+    uint16_t responseTimeoutMin = 150;
+    uint16_t responseTimeoutMax = 300;
+    uint16_t responseTimeoutStep = 10;
+
+    uint16_t bitTimeoutMin = 80;
+    uint16_t bitTimeoutMax = 150;
+    uint16_t bitTimeoutStep = 5;
+
+    uint16_t bitThresholdMin = 40;
+    uint16_t bitThresholdMax = 60;
+    uint16_t bitThresholdStep = 2;
+
+    int testsPerConfig = 30; // Number of reads per configuration
+};
+
+DOEConfig doeConfig;
+
+// DOE Results
+struct DOEResult {
+    uint16_t startSignal;
+    uint16_t responseTimeout;
+    uint16_t bitTimeout;
+    uint16_t bitThreshold;
+    int successCount;
+    int failCount;
+    float successRate;
+};
+
+// Best result tracking (initialized with default timing parameters)
+DOEResult bestResult = {1100, 200, 100, 50, 0, 0, 0.0};
 
 // Function prototypes
 void takeMeasurement();
@@ -68,10 +123,68 @@ String createJsonPayload(float temperature, float humidity);
 String createShortPayload(float temperature, float humidity);
 void loadPublishIntervalFromEEPROM();
 void savePublishIntervalToEEPROM(int intervalSeconds);
+void loadTimingParametersFromEEPROM();
+void saveTimingParametersToEEPROM();
 void updateBufferSize();
+String getResetReasonString();
 int setPublishInterval(String command);
 int forceReading(String command);
 int enableShortMsg(String command);
+int setStartSignalTiming(String command);
+int setResponseTimeoutTiming(String command);
+int setBitTimeoutTiming(String command);
+int setBitThresholdTiming(String command);
+int publishUptime(String command);
+
+// DOE function prototypes
+int startDOE(String command);
+int stopDOE(String command);
+void runDOEExperiment();
+DOEResult testParameterSet(uint16_t startSignal, uint16_t responseTimeout,
+                           uint16_t bitTimeout, uint16_t bitThreshold);
+void publishDOEStatus(String status);
+void publishDOEResult(DOEResult result, bool isBest);
+void publishPhaseSummary(String paramName, DOEResult* results, int resultCount);
+
+// Get human-readable reset reason string
+String getResetReasonString() {
+    int reason = System.resetReason();
+
+    switch(reason) {
+        case RESET_REASON_NONE:
+            return "none";
+        case RESET_REASON_UNKNOWN:
+            return "unknown";
+        case RESET_REASON_PIN_RESET:
+            return "pin_reset";
+        case RESET_REASON_POWER_MANAGEMENT:
+            return "power_management";
+        case RESET_REASON_POWER_DOWN:
+            return "power_down";
+        case RESET_REASON_POWER_BROWNOUT:
+            return "brownout";
+        case RESET_REASON_WATCHDOG:
+            return "watchdog";
+        case RESET_REASON_UPDATE:
+            return "update";
+        case RESET_REASON_UPDATE_ERROR:
+            return "update_error";
+        case RESET_REASON_UPDATE_TIMEOUT:
+            return "update_timeout";
+        case RESET_REASON_FACTORY_RESET:
+            return "factory_reset";
+        case RESET_REASON_SAFE_MODE:
+            return "safe_mode";
+        case RESET_REASON_DFU_MODE:
+            return "dfu_mode";
+        case RESET_REASON_PANIC:
+            return "panic";
+        case RESET_REASON_USER:
+            return "user";
+        default:
+            return "unknown_code_" + String(reason);
+    }
+}
 
 void setup() {
     // Load saved publish interval from EEPROM
@@ -84,6 +197,13 @@ void setup() {
     Particle.function("setInterval", setPublishInterval);
     Particle.function("forceReading", forceReading);
     Particle.function("enableShort", enableShortMsg);
+    Particle.function("startDOE", startDOE);
+    Particle.function("stopDOE", stopDOE);
+    Particle.function("setStartSig", setStartSignalTiming);
+    Particle.function("setRespTO", setResponseTimeoutTiming);
+    Particle.function("setBitTO", setBitTimeoutTiming);
+    Particle.function("setBitThr", setBitThresholdTiming);
+    Particle.function("uptime", publishUptime);
 
     // Register cloud variables
     Particle.variable("lastReading", lastReading);
@@ -93,14 +213,27 @@ void setup() {
     Particle.variable("humidity", cloudHumidity);
     Particle.variable("readingAge", readingAge);
     Particle.variable("bufferFill", bufferFillPercent);
+    Particle.variable("resetReason", resetReason);
+    Particle.variable("doeStatus", doeStatus);
+    Particle.variable("doeProgress", doeProgress);
+    Particle.variable("doePhase1", doePhase1Summary);
+    Particle.variable("doePhase2", doePhase2Summary);
+    Particle.variable("doePhase3", doePhase3Summary);
+    Particle.variable("doePhase4", doePhase4Summary);
+
+    // Read and store the last reset reason
+    resetReason = getResetReasonString();
 
     // Initialize DHT sensor
     dht.begin();
 
+    // Load saved timing parameters from EEPROM
+    loadTimingParametersFromEEPROM();
+
     // Wait for sensor to stabilize
     delay(2000);
 
-    Log.info("Remote Temp/Humidity Monitor v1.2.0");
+    Log.info("Remote Temp/Humidity Monitor v1.3.0");
     Log.info("Measurement interval: 10 seconds (fixed)");
     Log.info("Publish interval: %d seconds", currentPublishInterval);
     Log.info("Moving average buffer size: %d readings", bufferSize);
@@ -127,6 +260,13 @@ void setup() {
 }
 
 void loop() {
+    // If DOE experiment is active, run it instead of normal measurements
+    if (doeActive) {
+        runDOEExperiment();
+        // DOE will set doeActive to false when complete
+        return;
+    }
+
     // Check if it's time for a measurement (every 10 seconds)
     if (millis() - lastMeasurement >= MEASUREMENT_INTERVAL || firstRun) {
         takeMeasurement();
@@ -383,17 +523,17 @@ bool shouldPublish(float avgTemp, float avgHumidity) {
     // Calculate time since last publish
     unsigned long timeSincePublish = Time.now() - lastPublishTime;
 
-    // Check if 5x publish interval has elapsed (force publish)
-    if (timeSincePublish >= (publishInterval * 5)) {
-        Log.info("Publishing: 5x interval elapsed (%lu >= %lu seconds)",
-                 timeSincePublish, publishInterval * 5);
+    // Check if 60 minutes has elapsed (force publish)
+    if (timeSincePublish >= 3600) {
+        Log.info("Publishing: 60 minutes elapsed (%lu >= 3600 seconds)",
+                 timeSincePublish);
         return true;
     }
 
-    // Check if temperature changed by >= 0.25°C
+    // Check if temperature changed by >= 0.5°C
     float tempChange = abs(avgTemp - lastPublishedTemp);
-    if (tempChange >= 0.25) {
-        Log.info("Publishing: temp changed %.2f°C (>= 0.25°C)", tempChange);
+    if (tempChange >= 0.5) {
+        Log.info("Publishing: temp changed %.2f°C (>= 0.5°C)", tempChange);
         return true;
     }
 
@@ -509,5 +649,785 @@ int enableShortMsg(String command) {
         Log.info("Short messages disabled");
         Particle.publish("config/shortmsg", "disabled", PRIVATE);
         return 0;
+    }
+}
+
+// Cloud function to publish system uptime
+int publishUptime(String command) {
+    // Get system uptime in seconds
+    system_tick_t uptimeSeconds = System.uptime();
+
+    // Calculate days, hours, minutes
+    uint32_t days = uptimeSeconds / 86400;
+    uint32_t hours = (uptimeSeconds % 86400) / 3600;
+    uint32_t minutes = (uptimeSeconds % 3600) / 60;
+    uint32_t seconds = uptimeSeconds % 60;
+
+    // Get current time
+    String currentTime = Time.format(Time.now(), "%H:%M:%S");
+
+    // Get free memory
+    uint32_t freeMem = System.freeMemory();
+
+    // Get cloud connection status
+    String cloudStatus = Particle.connected() ? "connected" : "disconnected";
+
+    // Format uptime string similar to Linux uptime command
+    // Example: "10:15:23 up 5 days, 3:42, cloud: connected, free mem: 45632 bytes"
+    char uptimeMsg[256];
+
+    if (days > 0) {
+        snprintf(uptimeMsg, sizeof(uptimeMsg),
+                 "%s up %lu day%s, %lu:%02lu, cloud: %s, free mem: %lu bytes",
+                 currentTime.c_str(), days, (days == 1 ? "" : "s"),
+                 hours, minutes, cloudStatus.c_str(), freeMem);
+    } else if (hours > 0) {
+        snprintf(uptimeMsg, sizeof(uptimeMsg),
+                 "%s up %lu:%02lu, cloud: %s, free mem: %lu bytes",
+                 currentTime.c_str(), hours, minutes, cloudStatus.c_str(), freeMem);
+    } else {
+        snprintf(uptimeMsg, sizeof(uptimeMsg),
+                 "%s up %lu min, cloud: %s, free mem: %lu bytes",
+                 currentTime.c_str(), minutes, cloudStatus.c_str(), freeMem);
+    }
+
+    // Publish to cloud
+    if (Particle.connected()) {
+        Particle.publish("system/uptime", uptimeMsg, PRIVATE);
+    }
+
+    // Log locally
+    Log.info("Uptime: %s", uptimeMsg);
+
+    return 1;
+}
+
+// ====================================================================
+// Timing Parameter Configuration Functions
+// ====================================================================
+
+// Load timing parameters from EEPROM
+void loadTimingParametersFromEEPROM() {
+    uint32_t magic;
+    uint16_t startSignal, responseTimeout, bitTimeout, bitThreshold;
+
+    // Check if EEPROM has valid data by reading magic number
+    EEPROM.get(EEPROM_MAGIC_ADDR, magic);
+
+    if (magic == EEPROM_MAGIC) {
+        // Valid data exists, load the timing parameters
+        EEPROM.get(EEPROM_START_SIGNAL_ADDR, startSignal);
+        EEPROM.get(EEPROM_RESPONSE_TIMEOUT_ADDR, responseTimeout);
+        EEPROM.get(EEPROM_BIT_TIMEOUT_ADDR, bitTimeout);
+        EEPROM.get(EEPROM_BIT_THRESHOLD_ADDR, bitThreshold);
+
+        // Validate loaded values against DOE limits
+        bool valid = true;
+        if (startSignal < doeConfig.startSignalMin || startSignal > doeConfig.startSignalMax) {
+            Log.warn("EEPROM start signal %d out of range, using default", startSignal);
+            valid = false;
+        }
+        if (responseTimeout < doeConfig.responseTimeoutMin || responseTimeout > doeConfig.responseTimeoutMax) {
+            Log.warn("EEPROM response timeout %d out of range, using default", responseTimeout);
+            valid = false;
+        }
+        if (bitTimeout < doeConfig.bitTimeoutMin || bitTimeout > doeConfig.bitTimeoutMax) {
+            Log.warn("EEPROM bit timeout %d out of range, using default", bitTimeout);
+            valid = false;
+        }
+        if (bitThreshold < doeConfig.bitThresholdMin || bitThreshold > doeConfig.bitThresholdMax) {
+            Log.warn("EEPROM bit threshold %d out of range, using default", bitThreshold);
+            valid = false;
+        }
+
+        if (valid) {
+            // Apply loaded parameters to DHT22
+            dht.setStartSignal(startSignal);
+            dht.setResponseTimeout(responseTimeout);
+            dht.setBitTimeout(bitTimeout);
+            dht.setBitThreshold(bitThreshold);
+
+            Log.info("Loaded timing parameters from EEPROM:");
+            Log.info("  Start Signal: %d us", startSignal);
+            Log.info("  Response Timeout: %d us", responseTimeout);
+            Log.info("  Bit Timeout: %d us", bitTimeout);
+            Log.info("  Bit Threshold: %d us", bitThreshold);
+        } else {
+            Log.info("Using default timing parameters");
+        }
+    } else {
+        Log.info("No valid timing parameters in EEPROM, using defaults");
+    }
+}
+
+// Save current timing parameters to EEPROM
+void saveTimingParametersToEEPROM() {
+    uint16_t startSignal = dht.getStartSignal();
+    uint16_t responseTimeout = dht.getResponseTimeout();
+    uint16_t bitTimeout = dht.getBitTimeout();
+    uint16_t bitThreshold = dht.getBitThreshold();
+
+    // Save parameters
+    EEPROM.put(EEPROM_START_SIGNAL_ADDR, startSignal);
+    EEPROM.put(EEPROM_RESPONSE_TIMEOUT_ADDR, responseTimeout);
+    EEPROM.put(EEPROM_BIT_TIMEOUT_ADDR, bitTimeout);
+    EEPROM.put(EEPROM_BIT_THRESHOLD_ADDR, bitThreshold);
+
+    Log.info("Saved timing parameters to EEPROM:");
+    Log.info("  Start Signal: %d us", startSignal);
+    Log.info("  Response Timeout: %d us", responseTimeout);
+    Log.info("  Bit Timeout: %d us", bitTimeout);
+    Log.info("  Bit Threshold: %d us", bitThreshold);
+}
+
+// Cloud function to set start signal timing
+int setStartSignalTiming(String command) {
+    int value = command.toInt();
+
+    // Validate against DOE limits
+    if (value < doeConfig.startSignalMin || value > doeConfig.startSignalMax) {
+        Log.error("Start signal %d out of range (%d-%d us)",
+                  value, doeConfig.startSignalMin, doeConfig.startSignalMax);
+        return -1;
+    }
+
+    // Apply new value
+    dht.setStartSignal((uint16_t)value);
+
+    // Save to EEPROM
+    saveTimingParametersToEEPROM();
+
+    Log.info("Start signal timing updated to %d us", value);
+    Particle.publish("config/timing", String::format("start_signal=%d", value), PRIVATE);
+
+    return value;
+}
+
+// Cloud function to set response timeout timing
+int setResponseTimeoutTiming(String command) {
+    int value = command.toInt();
+
+    // Validate against DOE limits
+    if (value < doeConfig.responseTimeoutMin || value > doeConfig.responseTimeoutMax) {
+        Log.error("Response timeout %d out of range (%d-%d us)",
+                  value, doeConfig.responseTimeoutMin, doeConfig.responseTimeoutMax);
+        return -1;
+    }
+
+    // Apply new value
+    dht.setResponseTimeout((uint16_t)value);
+
+    // Save to EEPROM
+    saveTimingParametersToEEPROM();
+
+    Log.info("Response timeout updated to %d us", value);
+    Particle.publish("config/timing", String::format("response_timeout=%d", value), PRIVATE);
+
+    return value;
+}
+
+// Cloud function to set bit timeout timing
+int setBitTimeoutTiming(String command) {
+    int value = command.toInt();
+
+    // Validate against DOE limits
+    if (value < doeConfig.bitTimeoutMin || value > doeConfig.bitTimeoutMax) {
+        Log.error("Bit timeout %d out of range (%d-%d us)",
+                  value, doeConfig.bitTimeoutMin, doeConfig.bitTimeoutMax);
+        return -1;
+    }
+
+    // Apply new value
+    dht.setBitTimeout((uint16_t)value);
+
+    // Save to EEPROM
+    saveTimingParametersToEEPROM();
+
+    Log.info("Bit timeout updated to %d us", value);
+    Particle.publish("config/timing", String::format("bit_timeout=%d", value), PRIVATE);
+
+    return value;
+}
+
+// Cloud function to set bit threshold timing
+int setBitThresholdTiming(String command) {
+    int value = command.toInt();
+
+    // Validate against DOE limits
+    if (value < doeConfig.bitThresholdMin || value > doeConfig.bitThresholdMax) {
+        Log.error("Bit threshold %d out of range (%d-%d us)",
+                  value, doeConfig.bitThresholdMin, doeConfig.bitThresholdMax);
+        return -1;
+    }
+
+    // Apply new value
+    dht.setBitThreshold((uint16_t)value);
+
+    // Save to EEPROM
+    saveTimingParametersToEEPROM();
+
+    Log.info("Bit threshold updated to %d us", value);
+    Particle.publish("config/timing", String::format("bit_threshold=%d", value), PRIVATE);
+
+    return value;
+}
+
+// ====================================================================
+// DOE (Design of Experiments) Functions
+// ====================================================================
+
+// Cloud function to start DOE experiment
+int startDOE(String command) {
+    if (doeActive) {
+        Log.warn("DOE already running");
+        return -1;
+    }
+
+    Log.info("Starting DOE experiment for 1-wire timing optimization");
+    doeActive = true;
+    doeStatus = "starting";
+    doeProgress = 0;
+    doeStartTime = Time.now();
+
+    // Reset best result tracking
+    bestResult.successCount = 0;
+    bestResult.failCount = 0;
+    bestResult.successRate = 0.0;
+
+    // Clear previous phase summaries
+    doePhase1Summary = "{}";
+    doePhase2Summary = "{}";
+    doePhase3Summary = "{}";
+    doePhase4Summary = "{}";
+
+    publishDOEStatus("DOE experiment started");
+
+    return 1;
+}
+
+// Cloud function to stop DOE experiment
+int stopDOE(String command) {
+    if (!doeActive) {
+        Log.warn("DOE not running");
+        return -1;
+    }
+
+    Log.info("Stopping DOE experiment");
+    doeActive = false;
+    doeStatus = "stopped";
+
+    // Restore default timing parameters
+    dht.resetTimingDefaults();
+
+    publishDOEStatus("DOE experiment stopped by user");
+
+    return 1;
+}
+
+// Main DOE experiment - runs through all parameter combinations
+void runDOEExperiment() {
+    Log.info("=== DOE Experiment Running ===");
+    doeStatus = "running";
+
+    // Calculate total number of tests
+    int startSignalSteps = (doeConfig.startSignalMax - doeConfig.startSignalMin) / doeConfig.startSignalStep + 1;
+    int responseTimeoutSteps = (doeConfig.responseTimeoutMax - doeConfig.responseTimeoutMin) / doeConfig.responseTimeoutStep + 1;
+    int bitTimeoutSteps = (doeConfig.bitTimeoutMax - doeConfig.bitTimeoutMin) / doeConfig.bitTimeoutStep + 1;
+    int bitThresholdSteps = (doeConfig.bitThresholdMax - doeConfig.bitThresholdMin) / doeConfig.bitThresholdStep + 1;
+
+    int totalTests = startSignalSteps * responseTimeoutSteps * bitTimeoutSteps * bitThresholdSteps;
+    int testsCompleted = 0;
+
+    Log.info("DOE Configuration:");
+    Log.info("  Start Signal: %d-%d us (step %d) = %d tests",
+             doeConfig.startSignalMin, doeConfig.startSignalMax, doeConfig.startSignalStep, startSignalSteps);
+    Log.info("  Response Timeout: %d-%d us (step %d) = %d tests",
+             doeConfig.responseTimeoutMin, doeConfig.responseTimeoutMax, doeConfig.responseTimeoutStep, responseTimeoutSteps);
+    Log.info("  Bit Timeout: %d-%d us (step %d) = %d tests",
+             doeConfig.bitTimeoutMin, doeConfig.bitTimeoutMax, doeConfig.bitTimeoutStep, bitTimeoutSteps);
+    Log.info("  Bit Threshold: %d-%d us (step %d) = %d tests",
+             doeConfig.bitThresholdMin, doeConfig.bitThresholdMax, doeConfig.bitThresholdStep, bitThresholdSteps);
+    Log.info("  Tests per config: %d", doeConfig.testsPerConfig);
+    Log.info("  Total configurations: %d", totalTests);
+
+    // Test each parameter independently (one-factor-at-a-time design)
+    // This is more manageable than full factorial design
+
+    // Phase 1: Test Start Signal parameter
+    doeStatus = "testing_start_signal";
+    Log.info("--- Phase 1: Testing Start Signal Parameter ---");
+    publishDOEStatus("Phase 1/4: Testing start signal timing");
+
+    uint16_t bestStartSignal = 1100; // Default value
+    float bestStartSignalRate = 0.0;
+
+    // Collect all results for this phase
+    DOEResult startSignalResults[20]; // Max 20 results (generous for 800-2000 step 100)
+    int startSignalResultCount = 0;
+
+    for (uint16_t startSignal = doeConfig.startSignalMin;
+         startSignal <= doeConfig.startSignalMax;
+         startSignal += doeConfig.startSignalStep) {
+
+        DOEResult result = testParameterSet(startSignal, 200, 100, 50);
+
+        // Store result for summary
+        if (startSignalResultCount < 20) {
+            startSignalResults[startSignalResultCount++] = result;
+        }
+
+        if (result.successRate > bestStartSignalRate) {
+            bestStartSignalRate = result.successRate;
+            bestStartSignal = result.startSignal;
+            bestResult = result;
+            publishDOEResult(result, true);
+        } else {
+            publishDOEResult(result, false);
+        }
+
+        testsCompleted++;
+        doeProgress = (testsCompleted * 100) / (startSignalSteps + responseTimeoutSteps + bitTimeoutSteps + bitThresholdSteps);
+
+        // Allow cloud communication
+        Particle.process();
+        delay(100);
+
+        // Check if stopped
+        if (!doeActive) {
+            Log.info("DOE stopped during start signal testing");
+            return;
+        }
+    }
+
+    Log.info("Best start signal: %d us (%.1f%% success)", bestStartSignal, bestStartSignalRate);
+
+    // Publish phase 1 summary statistics
+    publishPhaseSummary("start_signal", startSignalResults, startSignalResultCount);
+
+    // Phase 2: Test Response Timeout parameter (using best start signal)
+    doeStatus = "testing_response_timeout";
+    Log.info("--- Phase 2: Testing Response Timeout Parameter ---");
+    publishDOEStatus("Phase 2/4: Testing response timeout");
+
+    uint16_t bestResponseTimeout = 200;
+    float bestResponseTimeoutRate = 0.0;
+
+    // Collect all results for this phase
+    DOEResult responseTimeoutResults[20]; // Max 20 results
+    int responseTimeoutResultCount = 0;
+
+    for (uint16_t responseTimeout = doeConfig.responseTimeoutMin;
+         responseTimeout <= doeConfig.responseTimeoutMax;
+         responseTimeout += doeConfig.responseTimeoutStep) {
+
+        DOEResult result = testParameterSet(bestStartSignal, responseTimeout, 100, 50);
+
+        // Store result for summary
+        if (responseTimeoutResultCount < 20) {
+            responseTimeoutResults[responseTimeoutResultCount++] = result;
+        }
+
+        if (result.successRate > bestResponseTimeoutRate) {
+            bestResponseTimeoutRate = result.successRate;
+            bestResponseTimeout = result.responseTimeout;
+            bestResult = result;
+            publishDOEResult(result, true);
+        } else {
+            publishDOEResult(result, false);
+        }
+
+        testsCompleted++;
+        doeProgress = (testsCompleted * 100) / (startSignalSteps + responseTimeoutSteps + bitTimeoutSteps + bitThresholdSteps);
+
+        Particle.process();
+        delay(100);
+
+        if (!doeActive) {
+            Log.info("DOE stopped during response timeout testing");
+            return;
+        }
+    }
+
+    Log.info("Best response timeout: %d us (%.1f%% success)", bestResponseTimeout, bestResponseTimeoutRate);
+
+    // Publish phase 2 summary statistics
+    publishPhaseSummary("response_timeout", responseTimeoutResults, responseTimeoutResultCount);
+
+    // Phase 3: Test Bit Timeout parameter
+    doeStatus = "testing_bit_timeout";
+    Log.info("--- Phase 3: Testing Bit Timeout Parameter ---");
+    publishDOEStatus("Phase 3/4: Testing bit timeout");
+
+    uint16_t bestBitTimeout = 100;
+    float bestBitTimeoutRate = 0.0;
+
+    // Collect all results for this phase
+    DOEResult bitTimeoutResults[20]; // Max 20 results
+    int bitTimeoutResultCount = 0;
+
+    for (uint16_t bitTimeout = doeConfig.bitTimeoutMin;
+         bitTimeout <= doeConfig.bitTimeoutMax;
+         bitTimeout += doeConfig.bitTimeoutStep) {
+
+        DOEResult result = testParameterSet(bestStartSignal, bestResponseTimeout, bitTimeout, 50);
+
+        // Store result for summary
+        if (bitTimeoutResultCount < 20) {
+            bitTimeoutResults[bitTimeoutResultCount++] = result;
+        }
+
+        if (result.successRate > bestBitTimeoutRate) {
+            bestBitTimeoutRate = result.successRate;
+            bestBitTimeout = result.bitTimeout;
+            bestResult = result;
+            publishDOEResult(result, true);
+        } else {
+            publishDOEResult(result, false);
+        }
+
+        testsCompleted++;
+        doeProgress = (testsCompleted * 100) / (startSignalSteps + responseTimeoutSteps + bitTimeoutSteps + bitThresholdSteps);
+
+        Particle.process();
+        delay(100);
+
+        if (!doeActive) {
+            Log.info("DOE stopped during bit timeout testing");
+            return;
+        }
+    }
+
+    Log.info("Best bit timeout: %d us (%.1f%% success)", bestBitTimeout, bestBitTimeoutRate);
+
+    // Publish phase 3 summary statistics
+    publishPhaseSummary("bit_timeout", bitTimeoutResults, bitTimeoutResultCount);
+
+    // Phase 4: Test Bit Threshold parameter
+    doeStatus = "testing_bit_threshold";
+    Log.info("--- Phase 4: Testing Bit Threshold Parameter ---");
+    publishDOEStatus("Phase 4/4: Testing bit threshold");
+
+    uint16_t bestBitThreshold = 50;
+    float bestBitThresholdRate = 0.0;
+
+    // Collect all results for this phase
+    DOEResult bitThresholdResults[20]; // Max 20 results
+    int bitThresholdResultCount = 0;
+
+    for (uint16_t bitThreshold = doeConfig.bitThresholdMin;
+         bitThreshold <= doeConfig.bitThresholdMax;
+         bitThreshold += doeConfig.bitThresholdStep) {
+
+        DOEResult result = testParameterSet(bestStartSignal, bestResponseTimeout, bestBitTimeout, bitThreshold);
+
+        // Store result for summary
+        if (bitThresholdResultCount < 20) {
+            bitThresholdResults[bitThresholdResultCount++] = result;
+        }
+
+        if (result.successRate > bestBitThresholdRate) {
+            bestBitThresholdRate = result.successRate;
+            bestBitThreshold = result.bitThreshold;
+            bestResult = result;
+            publishDOEResult(result, true);
+        } else {
+            publishDOEResult(result, false);
+        }
+
+        testsCompleted++;
+        doeProgress = (testsCompleted * 100) / (startSignalSteps + responseTimeoutSteps + bitTimeoutSteps + bitThresholdSteps);
+
+        Particle.process();
+        delay(100);
+
+        if (!doeActive) {
+            Log.info("DOE stopped during bit threshold testing");
+            return;
+        }
+    }
+
+    Log.info("Best bit threshold: %d us (%.1f%% success)", bestBitThreshold, bestBitThresholdRate);
+
+    // Publish phase 4 summary statistics
+    publishPhaseSummary("bit_threshold", bitThresholdResults, bitThresholdResultCount);
+
+    // DOE Complete!
+    doeStatus = "complete";
+    doeProgress = 100;
+    doeActive = false;
+
+    Log.info("=== DOE Experiment Complete ===");
+    Log.info("Optimal Parameters:");
+    Log.info("  Start Signal: %d us", bestResult.startSignal);
+    Log.info("  Response Timeout: %d us", bestResult.responseTimeout);
+    Log.info("  Bit Timeout: %d us", bestResult.bitTimeout);
+    Log.info("  Bit Threshold: %d us", bestResult.bitThreshold);
+    Log.info("  Success Rate: %.1f%% (%d/%d)",
+             bestResult.successRate, bestResult.successCount,
+             bestResult.successCount + bestResult.failCount);
+
+    // Apply optimal parameters
+    dht.setStartSignal(bestResult.startSignal);
+    dht.setResponseTimeout(bestResult.responseTimeout);
+    dht.setBitTimeout(bestResult.bitTimeout);
+    dht.setBitThreshold(bestResult.bitThreshold);
+
+    // Save optimal parameters to EEPROM for persistence
+    saveTimingParametersToEEPROM();
+
+    // Publish final results
+    char finalMsg[256];
+    snprintf(finalMsg, sizeof(finalMsg),
+             "DOE Complete! Best: SS=%d RT=%d BT=%d BTh=%d Rate=%.1f%%",
+             bestResult.startSignal, bestResult.responseTimeout,
+             bestResult.bitTimeout, bestResult.bitThreshold,
+             bestResult.successRate);
+
+    publishDOEStatus(finalMsg);
+
+    Log.info("Optimal parameters have been applied and saved to EEPROM");
+}
+
+// Test a specific parameter set
+DOEResult testParameterSet(uint16_t startSignal, uint16_t responseTimeout,
+                           uint16_t bitTimeout, uint16_t bitThreshold) {
+
+    DOEResult result;
+    result.startSignal = startSignal;
+    result.responseTimeout = responseTimeout;
+    result.bitTimeout = bitTimeout;
+    result.bitThreshold = bitThreshold;
+    result.successCount = 0;
+    result.failCount = 0;
+
+    // Configure DHT22 with test parameters
+    dht.setStartSignal(startSignal);
+    dht.setResponseTimeout(responseTimeout);
+    dht.setBitTimeout(bitTimeout);
+    dht.setBitThreshold(bitThreshold);
+
+    Log.info("Testing: SS=%d RT=%d BT=%d BTh=%d",
+             startSignal, responseTimeout, bitTimeout, bitThreshold);
+
+    // Perform multiple reads
+    for (int i = 0; i < doeConfig.testsPerConfig; i++) {
+        float temp, humidity;
+        bool success = dht.read(temp, humidity);
+
+        if (success) {
+            result.successCount++;
+        } else {
+            result.failCount++;
+        }
+
+        // Wait 2 seconds between reads (DHT22 requirement)
+        delay(2000);
+    }
+
+    result.successRate = (result.successCount * 100.0) / (result.successCount + result.failCount);
+
+    Log.info("Result: %d/%d success (%.1f%%)",
+             result.successCount, result.successCount + result.failCount,
+             result.successRate);
+
+    return result;
+}
+
+// Publish DOE status update
+void publishDOEStatus(String status) {
+    if (!Particle.connected()) {
+        return;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "{\"status\":\"%s\",\"progress\":%d,\"elapsed\":%lu}",
+             status.c_str(), doeProgress, Time.now() - doeStartTime);
+
+    Particle.publish("doe/status", msg, PRIVATE);
+    Log.info("DOE Status: %s", msg);
+}
+
+// Publish DOE result
+void publishDOEResult(DOEResult result, bool isBest) {
+    if (!Particle.connected()) {
+        return;
+    }
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "{\"ss\":%d,\"rt\":%d,\"bt\":%d,\"bth\":%d,\"success\":%d,\"fail\":%d,\"rate\":%.1f,\"best\":%s}",
+             result.startSignal, result.responseTimeout, result.bitTimeout, result.bitThreshold,
+             result.successCount, result.failCount, result.successRate,
+             isBest ? "true" : "false");
+
+    Particle.publish("doe/result", msg, PRIVATE);
+
+    if (isBest) {
+        Log.info("NEW BEST: %s", msg);
+    }
+}
+
+// Publish phase summary with statistics (for spreadsheet export)
+void publishPhaseSummary(String paramName, DOEResult* results, int resultCount) {
+    if (!Particle.connected() || resultCount == 0) {
+        return;
+    }
+
+    // Calculate statistics
+    float sumFailRate = 0.0;
+    float minFailRate = 100.0;
+    float maxFailRate = 0.0;
+    uint16_t bestValue = 0;
+
+    // First pass: sum and find min/max
+    for (int i = 0; i < resultCount; i++) {
+        float failRate = 100.0 - results[i].successRate;
+        sumFailRate += failRate;
+
+        if (failRate < minFailRate) {
+            minFailRate = failRate;
+            // Determine which parameter value this result represents
+            if (paramName == "start_signal") {
+                bestValue = results[i].startSignal;
+            } else if (paramName == "response_timeout") {
+                bestValue = results[i].responseTimeout;
+            } else if (paramName == "bit_timeout") {
+                bestValue = results[i].bitTimeout;
+            } else if (paramName == "bit_threshold") {
+                bestValue = results[i].bitThreshold;
+            }
+        }
+
+        if (failRate > maxFailRate) {
+            maxFailRate = failRate;
+        }
+    }
+
+    float avgFailRate = sumFailRate / resultCount;
+
+    // Second pass: calculate standard deviation
+    float sumSquaredDiff = 0.0;
+    for (int i = 0; i < resultCount; i++) {
+        float failRate = 100.0 - results[i].successRate;
+        float diff = failRate - avgFailRate;
+        sumSquaredDiff += diff * diff;
+    }
+    float stdDev = sqrt(sumSquaredDiff / resultCount);
+
+    // Calculate coefficient of variation (CV)
+    // CV = (stdDev / mean) * 100%
+    // Measures relative variability; lower CV = more consistent results
+    float cv = (avgFailRate > 0.001) ? (stdDev / avgFailRate) * 100.0 : 0.0;
+
+    // Calculate statistical significance (p-value approximation)
+    // Using z-score: z = (best - mean) / (stdDev / sqrt(n))
+    // This tests if the best result is significantly different from the mean
+    float zScore = 0.0;
+    float pValue = 1.0;
+
+    if (stdDev > 0.001 && resultCount > 1) {
+        // Standard error of the mean
+        float sem = stdDev / sqrt(resultCount);
+
+        // Z-score for best result vs. average
+        zScore = (avgFailRate - minFailRate) / sem;
+
+        // Convert z-score to approximate p-value using error function approximation
+        // This is a simplified one-tailed test
+        // For z > 0, p-value approximation using normal distribution
+        if (zScore > 0) {
+            // Simplified p-value approximation (good for z > 0)
+            // Using: p ≈ 0.5 * erfc(z / sqrt(2))
+            // Approximation: erfc(x) ≈ exp(-x²) / (x * sqrt(π))
+            float x = zScore / sqrt(2.0);
+            if (x > 0.1) {
+                // More accurate for larger z
+                pValue = 0.5 * exp(-x * x) / (x * sqrt(M_PI));
+            } else {
+                // For small z, use direct approximation
+                pValue = 0.5 * (1.0 - 0.5 * zScore * sqrt(2.0 / M_PI));
+            }
+
+            // Clamp p-value to valid range
+            if (pValue < 0.0001) pValue = 0.0001;
+            if (pValue > 1.0) pValue = 1.0;
+        }
+    }
+
+    // Build CSV-style data for spreadsheet export
+    // Format: value,success,fail,success_rate,fail_rate (one line per test)
+    String csvData = "";
+
+    for (int i = 0; i < resultCount; i++) {
+        uint16_t value;
+        if (paramName == "start_signal") {
+            value = results[i].startSignal;
+        } else if (paramName == "response_timeout") {
+            value = results[i].responseTimeout;
+        } else if (paramName == "bit_timeout") {
+            value = results[i].bitTimeout;
+        } else {
+            value = results[i].bitThreshold;
+        }
+
+        float failRate = 100.0 - results[i].successRate;
+
+        char line[80];
+        snprintf(line, sizeof(line), "%d,%d,%d,%.1f,%.1f\\n",
+                 value, results[i].successCount, results[i].failCount,
+                 results[i].successRate, failRate);
+        csvData += line;
+
+        // Particle publish has size limits, so we'll publish in chunks if needed
+        // or just send summary statistics in a separate message
+    }
+
+    // Publish summary statistics
+    char summaryMsg[622];
+    snprintf(summaryMsg, sizeof(summaryMsg),
+             "{\"param\":\"%s\",\"count\":%d,\"avg_fail\":%.2f,\"best_fail\":%.2f,\"worst_fail\":%.2f,"
+             "\"std_dev\":%.2f,\"cv\":%.2f,\"z_score\":%.2f,\"p_value\":%.4f,\"best_value\":%d}",
+             paramName.c_str(), resultCount, avgFailRate, minFailRate, maxFailRate,
+             stdDev, cv, zScore, pValue, bestValue);
+
+    Particle.publish("doe/phase_summary", summaryMsg, PRIVATE);
+
+    // Store summary in appropriate cloud variable for later retrieval
+    if (paramName == "start_signal") {
+        doePhase1Summary = String(summaryMsg);
+    } else if (paramName == "response_timeout") {
+        doePhase2Summary = String(summaryMsg);
+    } else if (paramName == "bit_timeout") {
+        doePhase3Summary = String(summaryMsg);
+    } else if (paramName == "bit_threshold") {
+        doePhase4Summary = String(summaryMsg);
+    }
+
+    Log.info("Phase Summary [%s]:", paramName.c_str());
+    Log.info("  Avg Fail: %.2f%%  Best: %.2f%%  Worst: %.2f%%", avgFailRate, minFailRate, maxFailRate);
+    Log.info("  StdDev: %.2f%%  CV: %.2f%%", stdDev, cv);
+    Log.info("  Z-Score: %.2f  P-Value: %.4f  Best Value: %d", zScore, pValue, bestValue);
+
+    // Publish detailed CSV data (may be split into multiple events if needed)
+    // Due to Particle event size limits (622 bytes for data), we publish in chunks
+    const int MAX_CSV_SIZE = 600;
+    int csvLength = csvData.length();
+    int chunks = (csvLength + MAX_CSV_SIZE - 1) / MAX_CSV_SIZE;
+
+    for (int chunk = 0; chunk < chunks; chunk++) {
+        int start = chunk * MAX_CSV_SIZE;
+        int end = min(start + MAX_CSV_SIZE, csvLength);
+        String csvChunk = csvData.substring(start, end);
+
+        char csvMsg[650];
+        snprintf(csvMsg, sizeof(csvMsg), "{\"param\":\"%s\",\"chunk\":%d,\"total\":%d,\"data\":\"%s\"}",
+                 paramName.c_str(), chunk + 1, chunks, csvChunk.c_str());
+
+        Particle.publish("doe/phase_data", csvMsg, PRIVATE);
+
+        // Small delay between chunks to avoid rate limiting
+        if (chunk < chunks - 1) {
+            delay(1000);
+        }
     }
 }

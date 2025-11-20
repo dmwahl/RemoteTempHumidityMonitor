@@ -6,6 +6,15 @@
 #include "SimpleDHT22.h"
 
 SimpleDHT22::SimpleDHT22(pin_t pin) : _pin(pin), _lastTemperature(0), _lastHumidity(0), _lastReadSuccess(false) {
+    // Initialize timing parameters to defaults
+    resetTimingDefaults();
+}
+
+void SimpleDHT22::resetTimingDefaults() {
+    _startSignal = 1100;      // 1.1ms start signal (per DHT22 datasheet: 1-10ms)
+    _responseTimeout = 200;   // 200us timeout for sensor response (conservative)
+    _bitTimeout = 100;        // 100us timeout for bit signals (conservative)
+    _bitThreshold = 50;       // 50us threshold for bit decision (per DHT22 datasheet)
 }
 
 void SimpleDHT22::begin() {
@@ -138,7 +147,7 @@ bool SimpleDHT22::readRawData(uint8_t data[5]) {
     // Step 1: Send start signal (pull low for 1-10ms, we use 1.1ms)
     pinMode(_pin, OUTPUT);
     digitalWrite(_pin, LOW);
-    delayHardwareMicros(DHT22_START_SIGNAL);  // Hardware timer delay
+    delayHardwareMicros(_startSignal);  // Hardware timer delay
 
     // Step 2: Release line (pull high briefly, then let pull-up take over)
     digitalWrite(_pin, HIGH);
@@ -147,21 +156,21 @@ bool SimpleDHT22::readRawData(uint8_t data[5]) {
     delayHardwareMicros(10);  // Small settling time
 
     // Step 3: Wait for sensor response - DHT pulls low for ~80us
-    if (!waitForState(LOW, DHT22_RESPONSE_TIMEOUT)) {
+    if (!waitForState(LOW, _responseTimeout)) {
         interrupts();
         stopHardwareTimer();
         return false;
     }
 
     // Step 4: Wait for sensor to pull high for ~80us
-    if (!waitForState(HIGH, DHT22_RESPONSE_TIMEOUT)) {
+    if (!waitForState(HIGH, _responseTimeout)) {
         interrupts();
         stopHardwareTimer();
         return false;
     }
 
     // Step 5: Wait for sensor to pull low (ready to send data)
-    if (!waitForState(LOW, DHT22_RESPONSE_TIMEOUT)) {
+    if (!waitForState(LOW, _responseTimeout)) {
         interrupts();
         stopHardwareTimer();
         return false;
@@ -171,7 +180,7 @@ bool SimpleDHT22::readRawData(uint8_t data[5]) {
     for (int i = 0; i < 5; i++) {
         for (int j = 7; j >= 0; j--) {
             // Wait for low-to-high transition (start of bit)
-            if (!waitForState(HIGH, DHT22_BIT_TIMEOUT)) {
+            if (!waitForState(HIGH, _bitTimeout)) {
                 interrupts();
                 stopHardwareTimer();
                 return false;
@@ -180,7 +189,7 @@ bool SimpleDHT22::readRawData(uint8_t data[5]) {
             // Measure high pulse duration to determine bit value using hardware timer
             // Bit 0: ~26-28us high, Bit 1: ~70us high
             uint32_t highStart = getHardwareMicros();
-            if (!waitForState(LOW, DHT22_BIT_TIMEOUT)) {
+            if (!waitForState(LOW, _bitTimeout)) {
                 interrupts();
                 stopHardwareTimer();
                 return false;
@@ -188,7 +197,7 @@ bool SimpleDHT22::readRawData(uint8_t data[5]) {
             uint32_t highDuration = getHardwareMicros() - highStart;
 
             // Threshold: >50us = 1, <50us = 0 (per DHT22 datasheet)
-            if (highDuration > DHT22_BIT_THRESHOLD) {
+            if (highDuration > _bitThreshold) {
                 data[i] |= (1 << j);
             }
         }

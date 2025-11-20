@@ -13,6 +13,7 @@ A cloud-connected temperature and humidity monitoring system for Particle Boron 
 - ✅ **Smart Publishing** - Publishes when temperature changes ≥0.25°C OR 5× interval elapsed
 - ✅ **Temperature Validation** - Automatic retry on >1°C jumps to filter sensor glitches
 - ✅ **Automatic Retry Logic** - Automatically retries failed reads once before reporting error
+- ✅ **DOE Timing Optimization** - Design of Experiments framework to find optimal 1-wire timing parameters
 - ✅ **Cloud Connected** - Real-time data access via Particle Cloud
 - ✅ **InfluxDB Compatible** - JSON output format ready for InfluxDB/Grafana
 - ✅ **Remote Control** - Cloud functions for interval adjustment and forced readings
@@ -116,9 +117,94 @@ curl https://api.particle.io/v1/devices/<device-id>/forceReading \
   -d access_token=<token>
 ```
 
+#### `startDOE` - Start Design of Experiments
+
+Start a comprehensive Design of Experiments (DOE) to find optimal 1-wire timing parameters. This systematically tests different timing combinations to maximize read success rate and minimize communication failures.
+
+```bash
+# Via Particle CLI
+particle call <device-name> startDOE ""
+
+# Via API
+curl https://api.particle.io/v1/devices/<device-id>/startDOE \
+  -d access_token=<token>
+```
+
+**What it does:**
+- Tests 4 timing parameters independently (one-factor-at-a-time design):
+  - **Start Signal**: 800-2000 µs (step 100) - 13 configurations
+  - **Response Timeout**: 150-300 µs (step 10) - 16 configurations
+  - **Bit Timeout**: 80-150 µs (step 5) - 15 configurations
+  - **Bit Threshold**: 40-60 µs (step 2) - 11 configurations
+- Performs 30 reads per configuration for statistical confidence
+- Total: ~55 configurations × 30 reads × 2s = **~55 minutes**
+- Publishes progress via `doe/status` and `doe/result` events
+- Automatically applies optimal parameters when complete
+
+**Monitoring progress:**
+```bash
+# Watch status updates
+particle subscribe doe/status
+
+# Watch individual test results
+particle subscribe doe/result
+
+# Check progress variables
+particle get <device-name> doeStatus
+particle get <device-name> doeProgress
+```
+
+**Event formats:**
+
+*doe/status event:*
+```json
+{
+  "status": "Phase 1/4: Testing start signal timing",
+  "progress": 25,
+  "elapsed": 420
+}
+```
+
+*doe/result event:*
+```json
+{
+  "ss": 1100,
+  "rt": 200,
+  "bt": 100,
+  "bth": 50,
+  "success": 28,
+  "fail": 2,
+  "rate": 93.3,
+  "best": true
+}
+```
+
+**Returns:**
+- `1` - DOE started successfully
+- `-1` - DOE already running
+
+**Note:** Normal measurements are paused during DOE. The experiment can be stopped at any time using `stopDOE`.
+
+#### `stopDOE` - Stop Design of Experiments
+
+Stop a running DOE experiment and restore default timing parameters.
+
+```bash
+# Via Particle CLI
+particle call <device-name> stopDOE ""
+
+# Via API
+curl https://api.particle.io/v1/devices/<device-id>/stopDOE \
+  -d access_token=<token>
+```
+
+**Returns:**
+- `1` - DOE stopped successfully
+- `-1` - No DOE running
+
 ### Cloud Variables
 
-Five read-only variables for monitoring:
+Seven read-only variables for monitoring:
 
 #### `temperature` - Latest Temperature Reading
 
@@ -176,6 +262,31 @@ Returns interval in seconds (e.g., `10`)
 
 **Note:** The measurement interval is persisted to EEPROM and survives device reboots.
 
+#### `doeStatus` - DOE Experiment Status
+
+```bash
+particle get <device-name> doeStatus
+```
+
+Returns current DOE status:
+- `"idle"` - No experiment running
+- `"starting"` - Experiment initializing
+- `"running"` - Experiment in progress
+- `"testing_start_signal"` - Testing start signal parameter (Phase 1/4)
+- `"testing_response_timeout"` - Testing response timeout (Phase 2/4)
+- `"testing_bit_timeout"` - Testing bit timeout (Phase 3/4)
+- `"testing_bit_threshold"` - Testing bit threshold (Phase 4/4)
+- `"complete"` - Experiment completed successfully
+- `"stopped"` - Experiment stopped by user
+
+#### `doeProgress` - DOE Progress Percentage
+
+```bash
+particle get <device-name> doeProgress
+```
+
+Returns progress as integer 0-100 (e.g., `45`)
+
 ### Published Events
 
 #### `sensor/reading` - Sensor Data
@@ -195,6 +306,60 @@ Published when sensor reading fails after retry.
 **Payloads:**
 - `"DHT22 read failed"` - Communication timeout or protocol error
 - `"Values out of range"` - Sensor returned invalid values
+
+#### `doe/status` - DOE Experiment Status Updates
+
+Published periodically during DOE experiments to report progress.
+
+**Event Name:** `doe/status`
+**Visibility:** Private
+**Rate:** At start of each phase and completion
+
+**Payload format:**
+```json
+{
+  "status": "Phase 2/4: Testing response timeout",
+  "progress": 45,
+  "elapsed": 1350
+}
+```
+
+**Fields:**
+- `status` - Human-readable status message
+- `progress` - Progress percentage (0-100)
+- `elapsed` - Seconds since experiment started
+
+#### `doe/result` - DOE Test Results
+
+Published after each parameter configuration is tested.
+
+**Event Name:** `doe/result`
+**Visibility:** Private
+**Rate:** After each configuration test (~every 60 seconds during DOE)
+
+**Payload format:**
+```json
+{
+  "ss": 1100,
+  "rt": 200,
+  "bt": 100,
+  "bth": 50,
+  "success": 28,
+  "fail": 2,
+  "rate": 93.3,
+  "best": true
+}
+```
+
+**Fields:**
+- `ss` - Start signal timing (microseconds)
+- `rt` - Response timeout (microseconds)
+- `bt` - Bit timeout (microseconds)
+- `bth` - Bit threshold (microseconds)
+- `success` - Number of successful reads
+- `fail` - Number of failed reads
+- `rate` - Success rate percentage
+- `best` - `true` if this is the best configuration so far
 
 ## Integration with InfluxDB & Grafana
 
@@ -711,6 +876,12 @@ float tempF = temperature * 9.0 / 5.0 + 32.0;
 3. ✅ Check for EMI sources nearby
 4. ✅ Verify stable power supply
 5. ✅ Update to latest firmware (includes retry logic)
+6. ✅ **Run DOE experiment** to find optimal timing parameters for your specific hardware setup:
+   ```bash
+   particle call <device-name> startDOE
+   particle subscribe doe/status  # Monitor progress
+   ```
+   The DOE will systematically test timing parameters and automatically apply the best settings.
 
 ### Device Not Connecting to Cloud
 
@@ -850,21 +1021,30 @@ David Wahl
 
 ---
 
-**Firmware Version:** 1.2.0
+**Firmware Version:** 1.3.0
 **Bridge Version:** 1.1.0
 **Last Updated:** 2025-01-29
 **Compatible Device OS:** 6.x
 
-## Recent Updates (v1.2.0)
+## Recent Updates
 
-### Firmware
+### v1.3.0 - DOE Timing Optimization
+- **Design of Experiments (DOE):** Systematic testing framework to find optimal 1-wire timing parameters
+- **Configurable Timing:** All DHT22 timing parameters now runtime-adjustable
+- **Cloud Functions:** Added `startDOE()` and `stopDOE()` for remote experiment control
+- **Cloud Variables:** Added `doeStatus` and `doeProgress` for monitoring
+- **Event Publishing:** Real-time `doe/status` and `doe/result` events during experiments
+- **Automatic Optimization:** Best parameters automatically applied upon completion
+- **Statistical Confidence:** 30 reads per configuration for reliable results
+
+### v1.2.0 - Moving Average & Smart Publishing
 - **Moving Average System:** Measurements taken every 10 seconds with configurable publish interval (default 300s)
 - **Dynamic Buffer:** Buffer size automatically calculated based on publish interval
 - **Smart Publishing:** Publishes when temperature changes ≥0.25°C OR 5× publish interval elapsed
 - **Temperature Validation:** >1°C changes trigger automatic retry
 - **Sensor Reliability:** DHT22 read failures trigger automatic retry before error reporting
 
-### Previous Updates (v1.1.0)
+### v1.1.0 - Reliability Enhancements
 - Temperature jump validation (>1°C changes trigger retry)
 - DHT22 read failure retry
 - Bridge connection health monitoring with 630-second timeout

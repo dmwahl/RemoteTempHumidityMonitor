@@ -68,6 +68,12 @@ String doeStatus = "idle"; // Current DOE status
 int doeProgress = 0; // Progress percentage (0-100)
 unsigned long doeStartTime = 0; // When DOE started
 
+// DOE Phase Results (stored as cloud-accessible JSON strings)
+String doePhase1Summary = "{}"; // Start signal phase summary
+String doePhase2Summary = "{}"; // Response timeout phase summary
+String doePhase3Summary = "{}"; // Bit timeout phase summary
+String doePhase4Summary = "{}"; // Bit threshold phase summary
+
 // DOE Configuration
 struct DOEConfig {
     // Parameter ranges for testing (in microseconds)
@@ -165,6 +171,10 @@ void setup() {
     Particle.variable("bufferFill", bufferFillPercent);
     Particle.variable("doeStatus", doeStatus);
     Particle.variable("doeProgress", doeProgress);
+    Particle.variable("doePhase1", doePhase1Summary);
+    Particle.variable("doePhase2", doePhase2Summary);
+    Particle.variable("doePhase3", doePhase3Summary);
+    Particle.variable("doePhase4", doePhase4Summary);
 
     // Initialize DHT sensor
     dht.begin();
@@ -786,6 +796,12 @@ int startDOE(String command) {
     bestResult.failCount = 0;
     bestResult.successRate = 0.0;
 
+    // Clear previous phase summaries
+    doePhase1Summary = "{}";
+    doePhase2Summary = "{}";
+    doePhase3Summary = "{}";
+    doePhase4Summary = "{}";
+
     publishDOEStatus("DOE experiment started");
 
     return 1;
@@ -1277,6 +1293,17 @@ void publishPhaseSummary(String paramName, DOEResult* results, int resultCount) 
              stdDev, cv, zScore, pValue, bestValue);
 
     Particle.publish("doe/phase_summary", summaryMsg, PRIVATE);
+
+    // Store summary in appropriate cloud variable for later retrieval
+    if (paramName == "start_signal") {
+        doePhase1Summary = String(summaryMsg);
+    } else if (paramName == "response_timeout") {
+        doePhase2Summary = String(summaryMsg);
+    } else if (paramName == "bit_timeout") {
+        doePhase3Summary = String(summaryMsg);
+    } else if (paramName == "bit_threshold") {
+        doePhase4Summary = String(summaryMsg);
+    }
 
     Log.info("Phase Summary [%s]:", paramName.c_str());
     Log.info("  Avg Fail: %.2f%%  Best: %.2f%%  Worst: %.2f%%", avgFailRate, minFailRate, maxFailRate);
